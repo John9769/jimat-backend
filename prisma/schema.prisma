@@ -1,0 +1,152 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserType {
+  HOUSEHOLD
+  INSTITUTIONAL
+}
+
+enum PaymentType {
+  ONBOARD
+  MONTHLY
+  RESET
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum ApplianceType {
+  AIRCOND
+  WATER_HEATER
+  REFRIGERATOR
+  WASHING_MACHINE
+  TV
+  LIGHTS
+  WATER_PUMP
+  RICE_COOKER
+  MICROWAVE
+  OVEN
+  COMPUTER
+  OTHER
+}
+
+model User {
+  id              String        @id @default(cuid())
+  email           String        @unique
+  password        String
+  name            String
+  phone           String?
+  userType        UserType      @default(HOUSEHOLD)
+  orgName         String?
+  postcode        String?
+  township        String?
+  state           String?
+  housingType     String?
+  language        String        @default("EN")
+  isActive        Boolean       @default(true)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  appliances      Appliance[]
+  billingRecords  BillingRecord[]
+  payments        Payment[]
+
+  @@map("users")
+}
+
+model Appliance {
+  id              String        @id @default(cuid())
+  userId          String
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roomName        String
+  applianceType   ApplianceType
+  brand           String?
+  hp              Float?
+  wattage         Float?
+  inverter        Boolean       @default(false)
+  ageYears        Float         @default(0)
+  qty             Int           @default(1)
+  avgHoursDaily   Float
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@map("appliances")
+}
+
+model BillingRecord {
+  id                String        @id @default(cuid())
+  userId            String
+  user              User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  billingMonth      String
+  billingPeriodDays Int           @default(30)
+  totalKwh          Float
+  totalAmountMyr    Float
+  generationCharge  Float         @default(0)
+  capacityCharge    Float         @default(0)
+  networkCharge     Float         @default(0)
+  retailCharge      Float         @default(0)
+  afaCharge         Float         @default(0)
+  eeRebate          Float         @default(0)
+  sstCharge         Float         @default(0)
+  kwtbbCharge       Float         @default(0)
+  rawOcrText        String?
+  isUnlocked        Boolean       @default(false)
+  reportData        Json?
+  teaserAmount      Float?
+  paymentId         String?
+  payment           Payment?      @relation(fields: [paymentId], references: [id])
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  @@map("billing_records")
+}
+
+model Payment {
+  id                String        @id @default(cuid())
+  userId            String
+  user              User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  billRef           String        @unique
+  amountMyr         Float
+  paymentType       PaymentType
+  status            PaymentStatus @default(PENDING)
+  toyyibpayBillCode String?
+  toyyibpayOrderId  String?
+  paidAt            DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  billingRecords    BillingRecord[]
+
+  @@map("payments")
+}
+
+model AfaRate {
+  id          String    @id @default(cuid())
+  month       String    @unique
+  rateSen     Float
+  note        String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@map("afa_rates")
+}
+
+model Admin {
+  id          String    @id @default(cuid())
+  email       String    @unique
+  password    String
+  name        String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@map("admins")
+}
