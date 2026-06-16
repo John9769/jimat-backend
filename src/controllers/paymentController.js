@@ -4,7 +4,6 @@ const { getChainStatus, getPricing } = require('../engine/chainEngine');
 
 const prisma = new PrismaClient();
 
-// Create ToyyibPay bill + Payment record atomically
 const createPayment = async (req, res) => {
   try {
     const { recordId } = req.body;
@@ -13,7 +12,6 @@ const createPayment = async (req, res) => {
       return res.status(400).json({ success: false, message: 'recordId required' });
     }
 
-    // Get billing record
     const record = await prisma.billingRecord.findFirst({
       where: { id: recordId, userId: req.user.id }
     });
@@ -26,7 +24,6 @@ const createPayment = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Report already unlocked' });
     }
 
-    // Check for existing PENDING payment for this record
     const existingPayment = await prisma.payment.findFirst({
       where: {
         userId: req.user.id,
@@ -36,7 +33,6 @@ const createPayment = async (req, res) => {
     });
 
     if (existingPayment) {
-      // Return existing bill code — dont create duplicate
       return res.json({
         success: true,
         billCode: existingPayment.toyyibpayBillCode,
@@ -45,22 +41,26 @@ const createPayment = async (req, res) => {
       });
     }
 
-    // Get chain status + pricing
     const chainStatus = await getChainStatus(req.user.id, prisma);
     const pricing = getPricing(req.user.userType, chainStatus.status);
 
-    // Determine ToyyibPay category
     const categoryCode = req.user.userType === 'INSTITUTIONAL'
       ? process.env.TOYYIBPAY_CATEGORY_INSTITUTIONAL
       : process.env.TOYYIBPAY_CATEGORY_HOUSEHOLD;
 
-    // Generate unique billRef
     const billRef = `JIMAT-${req.user.id.slice(-6).toUpperCase()}-${Date.now()}`;
-
-    // Amount in cents for ToyyibPay
     const amountCents = Math.round(pricing.total * 100);
 
-    // Create ToyyibPay bill
+    // Get full user details including email
+    const fullUser = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: {
+        name: true,
+        email: true,
+        phone: true
+      }
+    });
+
     const toyyibPayload = new URLSearchParams({
       userSecretKey: process.env.TOYYIBPAY_API_KEY,
       categoryCode,
@@ -72,8 +72,9 @@ const createPayment = async (req, res) => {
       billReturnUrl: `${process.env.FRONTEND_URL}/payment/success`,
       billCallbackUrl: `${process.env.BACKEND_URL || 'https://jimat-backend.onrender.com'}/api/payment/webhook`,
       billExternalReferenceNo: billRef,
-      billTo: req.user.name,
-      billPhone: req.user.phone || '0123456789',
+      billTo: fullUser.name,
+      billEmail: fullUser.email,
+      billPhone: fullUser.phone || '0123456789',
       billSplitPayment: 0,
       billSplitPaymentArgs: '',
       billPaymentChannel: 0,
@@ -99,7 +100,6 @@ const createPayment = async (req, res) => {
 
     const billCode = billData[0].BillCode;
 
-    // Save payment record
     const payment = await prisma.payment.create({
       data: {
         userId: req.user.id,
@@ -125,7 +125,6 @@ const createPayment = async (req, res) => {
   }
 };
 
-// ToyyibPay webhook — called by ToyyibPay server
 const webhook = async (req, res) => {
   try {
     const { billcode, order_id, status, reason } = req.body;
@@ -136,7 +135,6 @@ const webhook = async (req, res) => {
       return res.status(400).send('Missing billcode');
     }
 
-    // Find payment by bill code
     const payment = await prisma.payment.findFirst({
       where: { toyyibpayBillCode: billcode },
       include: { billingRecords: true }
@@ -147,17 +145,13 @@ const webhook = async (req, res) => {
       return res.status(404).send('Payment not found');
     }
 
-    // Prevent double processing
     if (payment.status === 'SUCCESS') {
       console.log('Payment already processed:', billcode);
       return res.status(200).send('Already processed');
     }
 
-    // status 1 = success, status 2 = pending, status 3 = failed
     if (status === '1') {
-      // SUCCESS — unlock report
       await prisma.$transaction(async (tx) => {
-        // Update payment status
         await tx.payment.update({
           where: { id: payment.id },
           data: {
@@ -167,7 +161,6 @@ const webhook = async (req, res) => {
           }
         });
 
-        // Unlock all billing records linked to this payment
         for (const record of payment.billingRecords) {
           await tx.billingRecord.update({
             where: { id: record.id },
@@ -178,7 +171,6 @@ const webhook = async (req, res) => {
 
       console.log('Payment SUCCESS — report unlocked for billcode:', billcode);
     } else {
-      // FAILED
       await prisma.payment.update({
         where: { id: payment.id },
         data: { status: 'FAILED' }
@@ -194,7 +186,6 @@ const webhook = async (req, res) => {
   }
 };
 
-// Check payment status — FE polls this after redirect
 const checkPaymentStatus = async (req, res) => {
   try {
     const { recordId } = req.params;
