@@ -7,11 +7,10 @@ const { getChainStatus, getPricing, validateBillingMonths } = require('../engine
 
 const prisma = new PrismaClient();
 
-// Multer — memory storage, no disk
 const storage = multer.memoryStorage();
 const upload = multer({
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = ['image/jpeg', 'image/png', 'image/jpg', 'application/pdf'];
     if (allowed.includes(file.mimetype)) {
@@ -22,19 +21,13 @@ const upload = multer({
   }
 });
 
-// Save appliances during onboarding
 const saveAppliances = async (req, res) => {
   try {
     const { appliances } = req.body;
-
     if (!appliances || !Array.isArray(appliances) || appliances.length === 0) {
       return res.status(400).json({ success: false, message: 'Appliances array required' });
     }
-
-    // Delete existing appliances first
     await prisma.appliance.deleteMany({ where: { userId: req.user.id } });
-
-    // Create new appliances
     const created = await prisma.appliance.createMany({
       data: appliances.map(a => ({
         userId: req.user.id,
@@ -49,36 +42,44 @@ const saveAppliances = async (req, res) => {
         avgHoursDaily: parseFloat(a.avgHoursDaily) || 0
       }))
     });
-
-    res.json({
-      success: true,
-      message: `${created.count} appliances saved`,
-      count: created.count
-    });
+    res.json({ success: true, message: `${created.count} appliances saved`, count: created.count });
   } catch (error) {
     console.error('Save appliances error:', error);
     res.status(500).json({ success: false, message: 'Failed to save appliances' });
   }
 };
 
-// Get chain status + pricing for current user
 const getChainInfo = async (req, res) => {
   try {
     const chainStatus = await getChainStatus(req.user.id, prisma);
     const pricing = getPricing(req.user.userType, chainStatus.status);
-
-    res.json({
-      success: true,
-      chain: chainStatus,
-      pricing
-    });
+    res.json({ success: true, chain: chainStatus, pricing });
   } catch (error) {
     console.error('Get chain info error:', error);
     res.status(500).json({ success: false, message: 'Failed to get chain info' });
   }
 };
 
-// Upload and OCR bill(s) — fires engine — returns teaser
+// Build AFA components from OCR data
+// Handles multiple AFA lines on same bill
+const buildAfaComponents = (ocrData) => {
+  // If OCR extracted multiple AFA components
+  if (ocrData.afaComponents && Array.isArray(ocrData.afaComponents) && ocrData.afaComponents.length > 0) {
+    return ocrData.afaComponents;
+  }
+
+  // If OCR extracted single AFA charge in RM — reverse calculate sen/kWh
+  if (ocrData.afaCharge && ocrData.totalKwh && ocrData.totalKwh > 0) {
+    const rateSen = (ocrData.afaCharge / ocrData.totalKwh) * 100;
+    return [{ rateSen: round2(rateSen), kwh: ocrData.totalKwh }];
+  }
+
+  // Fallback — use admin AFA rate from DB
+  return [];
+};
+
+const round2 = (val) => Math.round(val * 100) / 100;
+
 const uploadBills = async (req, res) => {
   try {
     const files = req.files;
@@ -89,7 +90,6 @@ const uploadBills = async (req, res) => {
     const chainStatus = await getChainStatus(req.user.id, prisma);
     const pricing = getPricing(req.user.userType, chainStatus.status);
 
-    // Validate file count matches chain requirement
     if (chainStatus.billsRequired === 2 && files.length < 2) {
       return res.status(400).json({
         success: false,
@@ -97,12 +97,12 @@ const uploadBills = async (req, res) => {
       });
     }
 
-    // Get current AFA rate
+    // Get admin AFA rate as fallback
     const currentMonth = new Date().toISOString().slice(0, 7);
     const afaRecord = await prisma.afaRate.findFirst({
       where: { month: currentMonth }
     });
-    const afaRateSen = afaRecord ? afaRecord.rateSen : 0;
+    const fallbackAfaRateSen = afaRecord ? afaRecord.rateSen : 0;
 
     // Get user appliances
     const appliances = await prisma.appliance.findMany({
@@ -139,10 +139,17 @@ const uploadBills = async (req, res) => {
     // Use the LATEST bill for analysis
     const latestOcr = ocrResults[ocrResults.length - 1];
 
-    // Run TNB math engine
+    // Build AFA components from OCR
+    // Use OCR-extracted AFA if available, else use admin fallback
+    let afaComponents = buildAfaComponents(latestOcr);
+    if (afaComponents.length === 0 && fallbackAfaRateSen !== 0) {
+      afaComponents = [{ rateSen: fallbackAfaRateSen, kwh: latestOcr.totalKwh }];
+    }
+
+    // Run corrected TNB math engine
     const billAnalysis = calculateTNBBill(
       latestOcr.totalKwh,
-      afaRateSen,
+      afaComponents,
       latestOcr.billingPeriodDays || 30
     );
 
@@ -161,17 +168,28 @@ const uploadBills = async (req, res) => {
 
     // Get previous bill for comparison
     const previousRecord = await prisma.billingRecord.findFirst({
-      where: { userId: req.user.id },
+      where: {
+        userId: req.user.id,
+        billingMonth: { lt: latestOcr.billingMonth }
+      },
       orderBy: { billingMonth: 'desc' }
     });
 
     let comparison = null;
     if (previousRecord) {
-      const prevAnalysis = calculateTNBBill(previousRecord.totalKwh, afaRateSen);
+      // Rebuild previous AFA components from stored data
+      const prevAfaComponents = previousRecord.afaCharge
+        ? [{ rateSen: (previousRecord.afaCharge / previousRecord.totalKwh) * 100, kwh: previousRecord.totalKwh }]
+        : [];
+      const prevAnalysis = calculateTNBBill(
+        previousRecord.totalKwh,
+        prevAfaComponents,
+        previousRecord.billingPeriodDays || 30
+      );
       comparison = compareBills(billAnalysis, prevAnalysis);
     }
 
-    // Calculate teaser amount — total potential saving
+    // Calculate teaser amount
     const teaserAmount = bleederResult
       ? bleederResult.totalPotentialSavingMyr
       : Math.round(latestOcr.totalAmountMyr * 0.15 * 100) / 100;
@@ -182,19 +200,24 @@ const uploadBills = async (req, res) => {
       bleeders: bleederResult,
       missions,
       comparison,
-      afaRateSen,
+      afaComponents,
       generatedAt: new Date().toISOString()
     };
 
-    // Save billing records (locked until payment)
+    // Save billing records
     const savedRecords = [];
     for (const ocr of ocrResults) {
-      // Check if this month already exists
       const existing = await prisma.billingRecord.findFirst({
         where: { userId: req.user.id, billingMonth: ocr.billingMonth }
       });
 
       if (!existing) {
+        // Calculate total AFA charge for storage
+        const ocrAfaComponents = buildAfaComponents(ocr);
+        const totalAfaCharge = ocrAfaComponents.reduce((sum, c) => {
+          return sum + ((c.kwh || ocr.totalKwh) * (c.rateSen / 100));
+        }, 0);
+
         const record = await prisma.billingRecord.create({
           data: {
             userId: req.user.id,
@@ -206,7 +229,7 @@ const uploadBills = async (req, res) => {
             capacityCharge: ocr.capacityCharge || 0,
             networkCharge: ocr.networkCharge || 0,
             retailCharge: ocr.retailCharge || 0,
-            afaCharge: ocr.afaCharge || 0,
+            afaCharge: round2(totalAfaCharge) || ocr.afaCharge || 0,
             eeRebate: ocr.eeRebate || 0,
             sstCharge: ocr.sstCharge || 0,
             kwtbbCharge: ocr.kwtbbCharge || 0,
@@ -225,7 +248,6 @@ const uploadBills = async (req, res) => {
         where: { userId: req.user.id, billingMonth: latestOcr.billingMonth }
       });
 
-    // Return TEASER — not full report
     res.json({
       success: true,
       teaser: {
@@ -245,7 +267,6 @@ const uploadBills = async (req, res) => {
   }
 };
 
-// Get billing history
 const getBillingHistory = async (req, res) => {
   try {
     const records = await prisma.billingRecord.findMany({
@@ -261,7 +282,6 @@ const getBillingHistory = async (req, res) => {
         createdAt: true
       }
     });
-
     res.json({ success: true, records });
   } catch (error) {
     console.error('Get billing history error:', error);
@@ -269,10 +289,4 @@ const getBillingHistory = async (req, res) => {
   }
 };
 
-module.exports = {
-  upload,
-  saveAppliances,
-  getChainInfo,
-  uploadBills,
-  getBillingHistory
-};
+module.exports = { upload, saveAppliances, getChainInfo, uploadBills, getBillingHistory };

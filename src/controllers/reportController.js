@@ -4,6 +4,31 @@ const { analyseBleeders, generateMissions } = require('../engine/bleederEngine')
 
 const prisma = new PrismaClient();
 
+// Rebuild AFA components from stored raw OCR data
+const rebuildAfaComponents = (record) => {
+  try {
+    // Try to get AFA components from stored rawOcrText
+    if (record.rawOcrText) {
+      const ocr = JSON.parse(record.rawOcrText);
+      if (ocr.afaComponents && Array.isArray(ocr.afaComponents) && ocr.afaComponents.length > 0) {
+        return ocr.afaComponents;
+      }
+    }
+  } catch (e) {
+    // ignore parse errors
+  }
+
+  // Fallback — reconstruct from stored afaCharge
+  if (record.afaCharge && record.totalKwh > 0) {
+    const rateSen = (record.afaCharge / record.totalKwh) * 100;
+    return [{ rateSen: Math.round(rateSen * 100) / 100, kwh: record.totalKwh, description: 'AFA', amountMyr: record.afaCharge }];
+  }
+
+  return [];
+};
+
+const round2 = (val) => Math.round(val * 100) / 100;
+
 // Get full unlocked report
 const getReport = async (req, res) => {
   try {
@@ -30,16 +55,25 @@ const getReport = async (req, res) => {
       where: { userId: req.user.id }
     });
 
-    // Get AFA rate for this billing month
+    // Rebuild AFA components from stored OCR data
+    const afaComponents = rebuildAfaComponents(record);
+
+    // Get admin AFA rate as fallback
     const afaRecord = await prisma.afaRate.findFirst({
       where: { month: record.billingMonth }
     });
-    const afaRateSen = afaRecord ? afaRecord.rateSen : 0;
 
-    // Recalculate fresh — never trust stored numbers blindly
+    // Use OCR AFA components if available, else use admin rate
+    const afaForEngine = afaComponents.length > 0
+      ? afaComponents
+      : afaRecord
+        ? [{ rateSen: afaRecord.rateSen, kwh: record.totalKwh, description: 'AFA', amountMyr: record.totalKwh * (afaRecord.rateSen / 100) }]
+        : [];
+
+    // Recalculate fresh with correct AFA
     const billAnalysis = calculateTNBBill(
       record.totalKwh,
-      afaRateSen,
+      afaForEngine,
       record.billingPeriodDays || 30
     );
 
@@ -67,23 +101,32 @@ const getReport = async (req, res) => {
     });
 
     let comparison = null;
-    let previousBillAnalysis = null;
     if (previousRecord) {
+      const prevAfaComponents = rebuildAfaComponents(previousRecord);
       const prevAfaRecord = await prisma.afaRate.findFirst({
         where: { month: previousRecord.billingMonth }
       });
-      const prevAfaSen = prevAfaRecord ? prevAfaRecord.rateSen : 0;
-      previousBillAnalysis = calculateTNBBill(previousRecord.totalKwh, prevAfaSen);
+      const prevAfaForEngine = prevAfaComponents.length > 0
+        ? prevAfaComponents
+        : prevAfaRecord
+          ? [{ rateSen: prevAfaRecord.rateSen, kwh: previousRecord.totalKwh }]
+          : [];
+
+      const previousBillAnalysis = calculateTNBBill(
+        previousRecord.totalKwh,
+        prevAfaForEngine,
+        previousRecord.billingPeriodDays || 30
+      );
       comparison = compareBills(billAnalysis, previousBillAnalysis);
     }
 
-    // Get AFA Watch — next month forecast
+    // AFA Watch — next month
     const nextMonth = getNextMonth(record.billingMonth);
     const nextAfaRecord = await prisma.afaRate.findFirst({
       where: { month: nextMonth }
     });
 
-    // Get user billing history for savings ledger
+    // Savings ledger
     const allRecords = await prisma.billingRecord.findMany({
       where: { userId: req.user.id, isUnlocked: true },
       orderBy: { billingMonth: 'asc' },
@@ -95,20 +138,25 @@ const getReport = async (req, res) => {
       }
     });
 
-    // Calculate total savings since joining
     const totalPayments = await prisma.payment.aggregate({
       where: { userId: req.user.id, status: 'SUCCESS' },
       _sum: { amountMyr: true }
     });
 
     const totalPotentialSaved = allRecords.reduce((sum, r) => sum + (r.teaserAmount || 0), 0);
+    const totalPaidToJimat = totalPayments._sum.amountMyr || 0;
+
+    // Calculate net AFA rate for display
+    const netAfaRateSen = afaComponents.length > 0
+      ? afaComponents.reduce((sum, c) => sum + c.rateSen, 0)
+      : afaRecord ? afaRecord.rateSen : 0;
 
     // Build full report
     const report = {
       // Screen 1 — Bill Autopsy
       billAutopsy: {
         billingMonth: record.billingMonth,
-        billingPeriodDays: record.billingPeriodDays,
+        billingPeriodDays: record.billingPeriodDays || 30,
         totalKwh: record.totalKwh,
         totalAmountMyr: record.totalAmountMyr,
         breakdown: {
@@ -117,12 +165,23 @@ const getReport = async (req, res) => {
           networkCharge: billAnalysis.networkCharge,
           retailCharge: billAnalysis.retailCharge,
           afaCharge: billAnalysis.afaCharge,
+          afaComponents: afaComponents,
           eeRebate: billAnalysis.eeRebate,
           kwtbbCharge: billAnalysis.kwtbbCharge,
           sstCharge: billAnalysis.sstCharge
         },
         effectiveRateSen: billAnalysis.effectiveRateSen,
-        flags: billAnalysis.flags
+        calculatedTotal: billAnalysis.totalBill,
+        flags: billAnalysis.flags,
+        // Accuracy check
+        accuracy: {
+          calculated: billAnalysis.totalBill,
+          actual: record.totalAmountMyr,
+          difference: round2(Math.abs(billAnalysis.totalBill - record.totalAmountMyr)),
+          percentDiff: record.totalAmountMyr > 0
+            ? round2(Math.abs((billAnalysis.totalBill - record.totalAmountMyr) / record.totalAmountMyr) * 100)
+            : 0
+        }
       },
 
       // Screen 2 — The Bleeder
@@ -152,12 +211,13 @@ const getReport = async (req, res) => {
       // Screen 5 — AFA Watch
       afaWatch: {
         currentMonth: record.billingMonth,
-        currentAfaRateSen: afaRateSen,
+        currentAfaRateSen: netAfaRateSen,
+        currentAfaComponents: afaComponents,
         nextMonth,
         nextAfaRateSen: nextAfaRecord ? nextAfaRecord.rateSen : null,
         nextAfaAvailable: !!nextAfaRecord,
         impactOnBillMyr: nextAfaRecord
-          ? Math.round(record.totalKwh * (nextAfaRecord.rateSen / 100) * 100) / 100
+          ? round2(record.totalKwh * (nextAfaRecord.rateSen / 100))
           : null,
         userExempt: record.totalKwh <= 600
       },
@@ -165,9 +225,9 @@ const getReport = async (req, res) => {
       // Savings Ledger
       savingsLedger: {
         monthsOnJimat: allRecords.length,
-        totalPotentialSavedMyr: Math.round(totalPotentialSaved * 100) / 100,
-        totalPaidToJimatMyr: Math.round((totalPayments._sum.amountMyr || 0) * 100) / 100,
-        netGainMyr: Math.round((totalPotentialSaved - (totalPayments._sum.amountMyr || 0)) * 100) / 100,
+        totalPotentialSavedMyr: round2(totalPotentialSaved),
+        totalPaidToJimatMyr: round2(totalPaidToJimat),
+        netGainMyr: round2(totalPotentialSaved - totalPaidToJimat),
         history: allRecords
       },
 
@@ -232,7 +292,6 @@ const getTeaser = async (req, res) => {
   }
 };
 
-// Helper
 const getNextMonth = (yearMonth) => {
   const [year, month] = yearMonth.split('-').map(Number);
   if (month === 12) return `${year + 1}-01`;
