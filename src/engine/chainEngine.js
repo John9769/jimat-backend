@@ -1,6 +1,7 @@
-// JIMAT Chain Engine v2
-// Full chain validation with wrong bill detection
-// and detailed user-facing error messages
+// JIMAT Chain Engine v3
+// Full chain validation with 2-bill 1-report business logic
+// Uses denormalised chainStatus on User model for fast lookups
+// isReference logic — first bill hidden, second bill = report
 
 const PRICING = {
   HOUSEHOLD: {
@@ -33,36 +34,55 @@ const formatMonth = (yearMonth, lang = 'EN') => {
   if (!yearMonth) return '';
   const [year, month] = yearMonth.split('-');
   const names = lang === 'BM' ? MONTH_NAMES_BM : MONTH_NAMES_EN;
-  return `${names[month]} ${year}`;
+  return `${names[month] || month} ${year}`;
 };
 
-// Get current chain status for user
+// ── GET CHAIN STATUS ──────────────────────────────────────
+// Uses User.chainStatus (denormalised) for fast check
+// Falls back to BillingRecord query if needed
 const getChainStatus = async (userId, prisma) => {
-  const records = await prisma.billingRecord.findMany({
-    where: { userId },
-    orderBy: { billingMonth: 'desc' },
-    take: 1
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      chainStatus: true,
+      lastBillingMonth: true,
+      chainBrokenAt: true
+    }
   });
 
-  // No records = new user = ONBOARD
-  if (records.length === 0) {
+  if (!user) throw new Error('User not found');
+
+  // Get latest NON-reference billing record
+  const lastRecord = await prisma.billingRecord.findFirst({
+    where: { userId, isReference: false },
+    orderBy: { billingMonth: 'desc' }
+  });
+
+  // No non-reference records = new user = ONBOARD
+  if (!lastRecord) {
+    // Check if there are ANY records (reference bills from failed onboard)
+    const anyRecord = await prisma.billingRecord.findFirst({
+      where: { userId },
+      orderBy: { billingMonth: 'desc' }
+    });
+
     return {
       status: 'ONBOARD',
       billsRequired: 2,
-      lastBillingMonth: null,
+      lastBillingMonth: anyRecord?.billingMonth || null,
       expectedNextMonth: null,
       monthsLapsed: 0
     };
   }
 
-  const lastRecord = records[0];
   const lastMonth = lastRecord.billingMonth;
   const expectedNextMonth = getNextMonth(lastMonth);
   const currentMonth = getCurrentMonth();
   const monthsLapsed = getMonthsDiff(lastMonth, currentMonth);
 
-  // Chain intact = last saved + 1 = current month
-  // Allow 1 month grace (current or previous month upload)
+  // Chain intact — expected next month is current or last month
+  // monthsLapsed === 1 means last saved is current month
+  // Allow upload of current month bill
   if (monthsLapsed === 1) {
     return {
       status: 'MONTHLY',
@@ -83,15 +103,30 @@ const getChainStatus = async (userId, prisma) => {
   };
 };
 
-// Validate uploaded bill months against chain
-// This is the CRITICAL function — prevents wrong bills
+// ── UPDATE USER CHAIN STATUS ──────────────────────────────
+// Called after bills are saved to DB
+// Keeps User.chainStatus denormalised for fast reads
+const updateUserChainStatus = async (userId, newStatus, lastBillingMonth, prisma) => {
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      chainStatus: newStatus,
+      lastBillingMonth,
+      chainBrokenAt: newStatus === 'RESET' ? new Date() : null
+    }
+  });
+};
+
+// ── VALIDATE UPLOADED BILLS ───────────────────────────────
+// THE CRITICAL GATEKEEPER
+// Validates months against chain before any DB save
+// Returns detailed error with expected vs received months
 const validateUploadedBills = async (uploadedMonths, userId, prisma, lang = 'EN') => {
   const sorted = [...uploadedMonths].sort();
-
-  // Get chain status
   const chainStatus = await getChainStatus(userId, prisma);
 
-  // Check for duplicate bills — already in DB
+  // ── DUPLICATE CHECK ───────────────────────────────────
+  // Cannot upload bill already in DB — reference or report
   for (const month of sorted) {
     const existing = await prisma.billingRecord.findFirst({
       where: { userId, billingMonth: month }
@@ -100,125 +135,119 @@ const validateUploadedBills = async (uploadedMonths, userId, prisma, lang = 'EN'
       return {
         valid: false,
         errorCode: 'DUPLICATE_BILL',
-        message: {
-          EN: `Bill for ${formatMonth(month, 'EN')} has already been analysed. Please upload a newer bill.`,
-          BM: `Bil untuk ${formatMonth(month, 'BM')} telah dianalisis sebelum ini. Sila muat naik bil yang lebih terkini.`
-        }[lang]
+        message: lang === 'BM'
+          ? `Bil ${formatMonth(month, 'BM')} sudah dianalisis sebelum ini. Sila muat naik bil yang lebih terkini.`
+          : `Bill for ${formatMonth(month, 'EN')} has already been analysed. Please upload a newer bill.`
       };
     }
   }
 
+  // ── ONBOARD VALIDATION ────────────────────────────────
   if (chainStatus.status === 'ONBOARD') {
-    // New user — need 2 consecutive bills
     if (sorted.length < 2) {
       return {
         valid: false,
         errorCode: 'NEED_TWO_BILLS',
-        message: {
-          EN: 'Please upload 2 consecutive months of TNB bills to get started.',
-          BM: 'Sila muat naik 2 bil TNB berturut-turut untuk bermula.'
-        }[lang]
+        message: lang === 'BM'
+          ? 'Sila muat naik 2 bil TNB berturut-turut untuk bermula. Contoh: Mei + Jun 2026.'
+          : 'Please upload 2 consecutive months of TNB bills to get started. Example: May + June 2026.'
       };
     }
 
-    // Validate consecutive
     if (getNextMonth(sorted[0]) !== sorted[1]) {
       return {
         valid: false,
         errorCode: 'NOT_CONSECUTIVE',
-        message: {
-          EN: `Bills must be consecutive months. You uploaded ${formatMonth(sorted[0], 'EN')} and ${formatMonth(sorted[1], 'EN')}. Example: upload May + June together.`,
-          BM: `Bil mesti bulan berturut-turut. Anda muat naik ${formatMonth(sorted[0], 'BM')} dan ${formatMonth(sorted[1], 'BM')}. Contoh: muat naik Mei + Jun bersama.`
-        }[lang]
+        message: lang === 'BM'
+          ? `Bil mesti berturut-turut. Anda muat naik ${formatMonth(sorted[0], 'BM')} dan ${formatMonth(sorted[1], 'BM')}. Contoh: muat naik Mei + Jun bersama.`
+          : `Bills must be consecutive. You uploaded ${formatMonth(sorted[0], 'EN')} and ${formatMonth(sorted[1], 'EN')}. Example: upload May + June together.`
       };
     }
 
     return {
       valid: true,
       status: 'ONBOARD',
-      month1: sorted[0],
-      month2: sorted[1],
+      referenceBill: sorted[0],  // First bill = REFERENCE (hidden)
+      reportBill: sorted[1],     // Second bill = REPORT
       latestMonth: sorted[1]
     };
   }
 
+  // ── MONTHLY VALIDATION ────────────────────────────────
   if (chainStatus.status === 'MONTHLY') {
-    // Loyal user — need exactly 1 bill = expectedNextMonth
-    if (sorted.length !== 1) {
+    // Loyal user uploads only 1 bill
+    if (sorted.length > 1) {
       return {
         valid: false,
         errorCode: 'ONE_BILL_ONLY',
-        message: {
-          EN: `You only need to upload 1 bill — your ${formatMonth(chainStatus.expectedNextMonth, 'EN')} bill.`,
-          BM: `Anda hanya perlu muat naik 1 bil — bil ${formatMonth(chainStatus.expectedNextMonth, 'BM')} anda.`
-        }[lang]
+        message: lang === 'BM'
+          ? `Anda hanya perlu muat naik 1 bil — bil ${formatMonth(chainStatus.expectedNextMonth, 'BM')} anda.`
+          : `You only need to upload 1 bill — your ${formatMonth(chainStatus.expectedNextMonth, 'EN')} bill.`
       };
     }
 
     const uploadedMonth = sorted[0];
 
-    // Wrong month uploaded
+    // Wrong month
     if (uploadedMonth !== chainStatus.expectedNextMonth) {
       return {
         valid: false,
         errorCode: 'WRONG_MONTH',
-        message: {
-          EN: `Wrong bill uploaded! We expected your ${formatMonth(chainStatus.expectedNextMonth, 'EN')} bill. You uploaded a ${formatMonth(uploadedMonth, 'EN')} bill. Please upload the correct bill.`,
-          BM: `Bil salah dimuat naik! Kami jangkakan bil ${formatMonth(chainStatus.expectedNextMonth, 'BM')} anda. Anda muat naik bil ${formatMonth(uploadedMonth, 'BM')}. Sila muat naik bil yang betul.`
-        }[lang]
+        message: lang === 'BM'
+          ? `Bil salah! Kami jangkakan bil ${formatMonth(chainStatus.expectedNextMonth, 'BM')} anda. Anda muat naik bil ${formatMonth(uploadedMonth, 'BM')}. Sila muat naik bil yang betul.`
+          : `Wrong bill! We expected your ${formatMonth(chainStatus.expectedNextMonth, 'EN')} bill. You uploaded ${formatMonth(uploadedMonth, 'EN')}. Please upload the correct bill.`
       };
     }
 
+    // Reference month for this report = last saved non-reference bill
     return {
       valid: true,
       status: 'MONTHLY',
-      month1: uploadedMonth,
+      referenceBill: chainStatus.lastBillingMonth, // Previous month in DB
+      reportBill: uploadedMonth,
       latestMonth: uploadedMonth
     };
   }
 
+  // ── RESET VALIDATION ──────────────────────────────────
   if (chainStatus.status === 'RESET') {
-    // Lapsed user — need 2 consecutive bills NEWER than last saved
     if (sorted.length < 2) {
       return {
         valid: false,
         errorCode: 'NEED_TWO_BILLS_RESET',
-        message: {
-          EN: `Your bill chain is broken (last bill: ${formatMonth(chainStatus.lastBillingMonth, 'EN')}). Please upload 2 consecutive recent bills to reset.`,
-          BM: `Rantaian bil anda terputus (bil terakhir: ${formatMonth(chainStatus.lastBillingMonth, 'BM')}). Sila muat naik 2 bil terkini berturut-turut untuk tetapkan semula.`
-        }[lang]
+        message: lang === 'BM'
+          ? `Rantaian bil anda terputus (bil terakhir: ${formatMonth(chainStatus.lastBillingMonth, 'BM')}). Muat naik 2 bil berturut-turut yang terkini untuk tetapkan semula.`
+          : `Your bill chain is broken (last bill: ${formatMonth(chainStatus.lastBillingMonth, 'EN')}). Upload 2 consecutive recent bills to reset.`
       };
     }
 
-    // Bills must be consecutive
+    // Must be consecutive
     if (getNextMonth(sorted[0]) !== sorted[1]) {
       return {
         valid: false,
         errorCode: 'NOT_CONSECUTIVE_RESET',
-        message: {
-          EN: `Bills must be consecutive months. You uploaded ${formatMonth(sorted[0], 'EN')} and ${formatMonth(sorted[1], 'EN')}. Please upload 2 consecutive months.`,
-          BM: `Bil mesti bulan berturut-turut. Anda muat naik ${formatMonth(sorted[0], 'BM')} dan ${formatMonth(sorted[1], 'BM')}. Sila muat naik 2 bulan berturut-turut.`
-        }[lang]
+        message: lang === 'BM'
+          ? `Bil mesti berturut-turut. Anda muat naik ${formatMonth(sorted[0], 'BM')} dan ${formatMonth(sorted[1], 'BM')}.`
+          : `Bills must be consecutive. You uploaded ${formatMonth(sorted[0], 'EN')} and ${formatMonth(sorted[1], 'EN')}.`
       };
     }
 
-    // Bills must be NEWER than last saved month
+    // Must be NEWER than last saved
     if (sorted[1] <= chainStatus.lastBillingMonth) {
       return {
         valid: false,
         errorCode: 'OLD_BILLS',
-        message: {
-          EN: `These bills are too old. Your last analysis was ${formatMonth(chainStatus.lastBillingMonth, 'EN')}. Please upload more recent bills.`,
-          BM: `Bil-bil ini terlalu lama. Analisis terakhir anda adalah ${formatMonth(chainStatus.lastBillingMonth, 'BM')}. Sila muat naik bil yang lebih terkini.`
-        }[lang]
+        message: lang === 'BM'
+          ? `Bil ini terlalu lama. Analisis terakhir anda: ${formatMonth(chainStatus.lastBillingMonth, 'BM')}. Sila muat naik bil yang lebih terkini.`
+          : `These bills are too old. Your last analysis: ${formatMonth(chainStatus.lastBillingMonth, 'EN')}. Please upload more recent bills.`
       };
     }
 
     return {
       valid: true,
       status: 'RESET',
-      month1: sorted[0],
-      month2: sorted[1],
+      referenceBill: sorted[0],  // First bill = REFERENCE (hidden)
+      reportBill: sorted[1],     // Second bill = REPORT
       latestMonth: sorted[1]
     };
   }
@@ -226,6 +255,37 @@ const validateUploadedBills = async (uploadedMonths, userId, prisma, lang = 'EN'
   return { valid: false, errorCode: 'UNKNOWN', message: 'Unknown chain status' };
 };
 
+// ── DETERMINE isReference ─────────────────────────────────
+// For each OCR result — is it the reference or the report?
+// ONBOARD/RESET: first bill = reference, second = report
+// MONTHLY: uploaded bill = report, previous in DB = reference
+const determineRoles = (validationResult, ocrResults) => {
+  const sorted = [...ocrResults].sort((a, b) =>
+    a.billingMonth.localeCompare(b.billingMonth)
+  );
+
+  if (validationResult.status === 'ONBOARD' || validationResult.status === 'RESET') {
+    return sorted.map((ocr, index) => ({
+      ...ocr,
+      isReference: index === 0,        // First = reference (hidden)
+      referenceMonth: index === 1 ? sorted[0].billingMonth : null
+    }));
+  }
+
+  if (validationResult.status === 'MONTHLY') {
+    // Only 1 bill uploaded — it is the report
+    // Reference = previous month already in DB
+    return sorted.map(ocr => ({
+      ...ocr,
+      isReference: false,
+      referenceMonth: validationResult.referenceBill
+    }));
+  }
+
+  return sorted;
+};
+
+// ── PRICING ───────────────────────────────────────────────
 const getPricing = (userType, chainStatus) => {
   const tier = userType === 'INSTITUTIONAL' ? 'INSTITUTIONAL' : 'HOUSEHOLD';
   const price = PRICING[tier][chainStatus] || PRICING[tier].ONBOARD;
@@ -238,26 +298,17 @@ const getPricing = (userType, chainStatus) => {
   };
 };
 
-// Legacy function — kept for backward compat
-const validateBillingMonths = (months) => {
-  if (months.length < 2) return { valid: false, reason: 'Need at least 2 months' };
-  const sorted = [...months].sort();
-  const first = sorted[0];
-  const second = sorted[1];
-  if (getNextMonth(first) !== second) {
-    return {
-      valid: false,
-      reason: `Bills must be consecutive months. Got ${first} and ${second}`
-    };
-  }
-  return { valid: true, month1: first, month2: second };
-};
-
-// Helpers
+// ── HELPERS ───────────────────────────────────────────────
 const getNextMonth = (yearMonth) => {
   const [year, month] = yearMonth.split('-').map(Number);
   if (month === 12) return `${year + 1}-01`;
   return `${year}-${String(month + 1).padStart(2, '0')}`;
+};
+
+const getPreviousMonth = (yearMonth) => {
+  const [year, month] = yearMonth.split('-').map(Number);
+  if (month === 1) return `${year - 1}-12`;
+  return `${year}-${String(month - 1).padStart(2, '0')}`;
 };
 
 const getCurrentMonth = () => {
@@ -271,17 +322,26 @@ const getMonthsDiff = (from, to) => {
   return (ty - fy) * 12 + (tm - fm);
 };
 
-const getPreviousMonth = (yearMonth) => {
-  const [year, month] = yearMonth.split('-').map(Number);
-  if (month === 1) return `${year - 1}-12`;
-  return `${year}-${String(month - 1).padStart(2, '0')}`;
+// Legacy — kept for backward compat
+const validateBillingMonths = (months) => {
+  if (months.length < 2) return { valid: false, reason: 'Need at least 2 months' };
+  const sorted = [...months].sort();
+  if (getNextMonth(sorted[0]) !== sorted[1]) {
+    return { valid: false, reason: `Not consecutive: ${sorted[0]} and ${sorted[1]}` };
+  }
+  return { valid: true, month1: sorted[0], month2: sorted[1] };
 };
 
 module.exports = {
   getChainStatus,
+  updateUserChainStatus,
   getPricing,
   validateBillingMonths,
   validateUploadedBills,
+  determineRoles,
   formatMonth,
+  getNextMonth,
+  getPreviousMonth,
+  getMonthsDiff,
   PRICING
 };
