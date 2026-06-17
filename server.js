@@ -11,6 +11,11 @@ app.use(cors({
   credentials: true
 }));
 
+// ── CRITICAL: Webhook route needs raw urlencoded parser BEFORE json parser ──
+// ToyyibPay sends webhook as application/x-www-form-urlencoded
+// Must be registered BEFORE express.json() to avoid conflicts
+app.use('/api/payment/webhook', express.urlencoded({ extended: true, limit: '10mb' }));
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -29,7 +34,7 @@ app.use('/api/admin', adminRoutes);
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ 
+  res.json({
     status: 'JIMAT API Running',
     version: '1.0.0',
     timestamp: new Date().toISOString()
