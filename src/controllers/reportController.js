@@ -1,5 +1,5 @@
 const { PrismaClient } = require('@prisma/client');
-const { calculateTNBBill, compareBills } = require('../engine/tnbEngine');
+const { calculateTNBBill } = require('../engine/tnbEngine');
 const { analyseBleeders, generateMissions } = require('../engine/bleederEngine');
 
 const prisma = new PrismaClient();
@@ -27,7 +27,7 @@ const getOcrData = (record) => {
   return {};
 };
 
-// Get cajSemasa from rawOcrText — current month only, no arrears
+// Get cajSemasa — current month charges only, no arrears
 const getCajSemasa = (record) => {
   const ocr = getOcrData(record);
   if (ocr.cajSemasa && ocr.cajSemasa > 0) return ocr.cajSemasa;
@@ -62,7 +62,7 @@ const getReport = async (req, res) => {
       });
     }
 
-    // OCR data — source of truth
+    // OCR data — source of truth for Bill Autopsy
     const ocrData = getOcrData(record);
 
     // Appliances
@@ -70,7 +70,7 @@ const getReport = async (req, res) => {
       where: { userId: req.user.id }
     });
 
-    // AFA components
+    // AFA components from OCR
     const afaComponents = rebuildAfaComponents(record);
 
     // Admin AFA fallback
@@ -84,29 +84,53 @@ const getReport = async (req, res) => {
         ? [{ rateSen: afaRecord.rateSen, kwh: record.totalKwh }]
         : [];
 
-    // Engine — effective rate for bleeder only
+    // cajSemasa — actual current month charges from OCR
+    const currentCajSemasa = getCajSemasa(record);
+
+    // ── EFFECTIVE RATE — FROM ACTUAL BILL ─────────────────
+    // Use cajSemasa ÷ totalKwh = real rate user actually paid
+    // NOT engine-calculated — avoids hallucinated figures
+    // This is what feeds the bleeder engine
+    const actualEffectiveRateSen = record.totalKwh > 0
+      ? round2((currentCajSemasa / record.totalKwh) * 100)
+      : 0;
+
+    console.log('Effective rate from actual bill:', {
+      cajSemasa: currentCajSemasa,
+      totalKwh: record.totalKwh,
+      effectiveRateSen: actualEffectiveRateSen
+    });
+
+    // Engine — only used for flags (aboveThreshold etc)
+    // NOT used for effective rate anymore
     const billAnalysis = calculateTNBBill(
       record.totalKwh,
       afaForEngine,
       record.billingPeriodDays || 30
     );
 
-    // Bleeder
+    // Override engine effective rate with actual bill rate
+    const engineForBleeder = {
+      ...billAnalysis,
+      effectiveRateSen: actualEffectiveRateSen
+    };
+
+    // ── BLEEDER ENGINE ────────────────────────────────────
+    // Uses ACTUAL effective rate from bill — not engine estimate
     let bleederResult = null;
     let missions = [];
     if (appliances.length > 0) {
       bleederResult = analyseBleeders(
         appliances,
         record.totalKwh,
-        billAnalysis.effectiveRateSen,
+        actualEffectiveRateSen,
         record.billingPeriodDays || 30
       );
-      missions = generateMissions(bleederResult, billAnalysis, req.user.language);
+      missions = generateMissions(bleederResult, engineForBleeder, req.user.language);
     }
 
     // ── MONTH VS MONTH ────────────────────────────────────
-    // Get previous UNLOCKED record
-    // Compare cajSemasa only — NOT totalAmountMyr (which includes arrears)
+    // Compare cajSemasa only — NOT totalAmountMyr (includes arrears)
     const previousRecord = await prisma.billingRecord.findFirst({
       where: {
         userId: req.user.id,
@@ -116,9 +140,7 @@ const getReport = async (req, res) => {
       orderBy: { billingMonth: 'desc' }
     });
 
-    const currentCajSemasa = getCajSemasa(record);
     let comparison = null;
-
     if (previousRecord) {
       const prevCajSemasa = getCajSemasa(previousRecord);
       const kwhDiff = record.totalKwh - previousRecord.totalKwh;
@@ -152,16 +174,15 @@ const getReport = async (req, res) => {
       where: { month: nextMonth }
     });
 
-    // Net AFA rate — sum of all components
     const netAfaRateSen = afaComponents.length > 0
       ? round2(afaComponents.reduce((sum, c) => sum + c.rateSen, 0))
       : afaRecord ? afaRecord.rateSen : 0;
 
     // ── SAVINGS LEDGER ────────────────────────────────────
-    // monthsOnJimat = unlocked records count
-    // totalPotentialSavedMyr = sum of teaserAmount from unlocked records
-    // totalPaidToJimat = actual payments made
-    // netGainMyr = potential saved MINUS what paid to JIMAT
+    // monthsAnalysed = unlocked records
+    // potentialSavingPerMonth = current bleeder total potential saving
+    // totalPaidToJimat = actual SUCCESS payments
+    // netGainMyr = potential saving minus paid to JIMAT
     const allUnlockedRecords = await prisma.billingRecord.findMany({
       where: { userId: req.user.id, isUnlocked: true },
       orderBy: { billingMonth: 'asc' },
@@ -178,16 +199,18 @@ const getReport = async (req, res) => {
       _sum: { amountMyr: true }
     });
 
-    const totalPotentialSaved = allUnlockedRecords.reduce((sum, r) => sum + (r.teaserAmount || 0), 0);
     const totalPaidToJimat = totalPayments._sum.amountMyr || 0;
-    const netGain = round2(totalPotentialSaved - totalPaidToJimat);
 
-    // ── BILL AUTOPSY ──────────────────────────────────────
-    // 100% OCR values — no engine recalculation
-    const afaNetCharge = ocrData.afaCharge !== undefined
-      ? ocrData.afaCharge
-      : record.afaCharge || 0;
+    // Potential saving = from bleeder engine (most accurate)
+    // If no bleeder, fallback to sum of teaserAmounts
+    const potentialSavingPerMonth = bleederResult
+      ? round2(bleederResult.totalPotentialSavingMyr)
+      : round2(allUnlockedRecords.reduce((sum, r) => sum + (r.teaserAmount || 0), 0) / (allUnlockedRecords.length || 1));
 
+    // Net gain = if user acts on all missions this month, what do they gain vs what they paid JIMAT
+    const netGainMyr = round2(Math.max(potentialSavingPerMonth - totalPaidToJimat, 0));
+
+    // ── BILL AUTOPSY FLAGS ────────────────────────────────
     const excessKwh = Math.max(record.totalKwh - 600, 0);
     const flags = {
       retailChargeWaived: excessKwh === 0,
@@ -199,7 +222,7 @@ const getReport = async (req, res) => {
     };
 
     const report = {
-      // Screen 1 — Bill Autopsy
+      // Screen 1 — Bill Autopsy (100% OCR values)
       billAutopsy: {
         billingMonth: record.billingMonth,
         billingPeriodDays: record.billingPeriodDays || 30,
@@ -210,13 +233,12 @@ const getReport = async (req, res) => {
         totalAmountMyr: ocrData.totalAmountMyr || record.totalAmountMyr,
         tunggakan: ocrData.tunggakan || 0,
         latePaymentCharge: ocrData.latePaymentCharge || 0,
-        // No effectiveRateSen — removed. Show billing period instead.
         breakdown: {
           generationCharge: ocrData.generationCharge || record.generationCharge || 0,
           capacityCharge: ocrData.capacityCharge || record.capacityCharge || 0,
           networkCharge: ocrData.networkCharge || record.networkCharge || 0,
           retailCharge: ocrData.retailCharge || record.retailCharge || 0,
-          afaCharge: afaNetCharge,
+          afaCharge: ocrData.afaCharge !== undefined ? ocrData.afaCharge : record.afaCharge || 0,
           afaComponents: ocrData.afaComponents || afaComponents || [],
           eeRebate: ocrData.eeRebate || record.eeRebate || 0,
           kwtbbCharge: ocrData.kwtbbCharge || record.kwtbbCharge || 0,
@@ -231,13 +253,14 @@ const getReport = async (req, res) => {
         topBleeder: bleederResult.topBleeder,
         allBleeders: bleederResult.bleeders,
         totalPotentialSavingMyr: bleederResult.totalPotentialSavingMyr,
-        coveragePercent: bleederResult.coveragePercent
+        coveragePercent: bleederResult.coveragePercent,
+        effectiveRateSenUsed: actualEffectiveRateSen
       } : null,
 
       // Screen 3 — Missions
       missions,
 
-      // Screen 4 — Month vs Month (cajSemasa comparison)
+      // Screen 4 — Month vs Month
       comparison,
 
       // Screen 5 — AFA Watch
@@ -257,12 +280,9 @@ const getReport = async (req, res) => {
       // Savings Ledger
       savingsLedger: {
         monthsAnalysed: allUnlockedRecords.length,
-        potentialSavingPerMonth: bleederResult
-          ? round2(bleederResult.totalPotentialSavingMyr)
-          : round2(totalPotentialSaved / (allUnlockedRecords.length || 1)),
-        totalPotentialSavedMyr: round2(totalPotentialSaved),
+        potentialSavingPerMonth,
         totalPaidToJimatMyr: round2(totalPaidToJimat),
-        netGainMyr: netGain > 0 ? netGain : 0,
+        netGainMyr,
         history: allUnlockedRecords
       },
 
@@ -273,6 +293,7 @@ const getReport = async (req, res) => {
     };
 
     res.json({ success: true, report });
+
   } catch (error) {
     console.error('Get report error:', error);
     res.status(500).json({ success: false, message: 'Failed to generate report' });
