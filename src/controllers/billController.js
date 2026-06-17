@@ -23,7 +23,6 @@ const upload = multer({
 
 const round2 = (val) => Math.round(val * 100) / 100;
 
-// Build AFA components from OCR data
 const buildAfaComponents = (ocrData) => {
   if (ocrData.afaComponents && Array.isArray(ocrData.afaComponents) && ocrData.afaComponents.length > 0) {
     return ocrData.afaComponents;
@@ -74,31 +73,164 @@ const getChainInfo = async (req, res) => {
   }
 };
 
-const uploadBills = async (req, res) => {
+// ── NEW ENDPOINT 1 — SCAN ONLY ────────────────────────────
+// OCR fires, validates, returns extracted values
+// NO database save — user must confirm first
+const scanBills = async (req, res) => {
   try {
     const files = req.files;
     if (!files || files.length === 0) {
       return res.status(400).json({ success: false, message: 'No files uploaded' });
     }
 
-    // Get chain status first
+    // Get chain status
     const chainStatus = await getChainStatus(req.user.id, prisma);
     const pricing = getPricing(req.user.userType, chainStatus.status);
 
-    // Check file count matches requirement
+    // Check file count
     if (chainStatus.billsRequired === 2 && files.length < 2) {
       return res.status(400).json({
         success: false,
         errorCode: 'NEED_TWO_BILLS',
-        message: chainStatus.status === 'RESET'
-          ? (req.user.language === 'BM'
-            ? `Rantaian bil anda terputus. Sila muat naik 2 bil berturut-turut untuk tetapkan semula.`
-            : `Your bill chain is broken. Please upload 2 consecutive bills to reset.`)
-          : (req.user.language === 'BM'
-            ? `Sila muat naik 2 bil TNB berturut-turut untuk bermula.`
-            : `Please upload 2 consecutive TNB bills to get started.`)
+        message: req.user.language === 'BM'
+          ? chainStatus.status === 'RESET'
+            ? 'Rantaian bil anda terputus. Sila muat naik 2 bil berturut-turut untuk tetapkan semula.'
+            : 'Sila muat naik 2 bil TNB berturut-turut untuk bermula.'
+          : chainStatus.status === 'RESET'
+            ? 'Your bill chain is broken. Please upload 2 consecutive bills to reset.'
+            : 'Please upload 2 consecutive TNB bills to get started.'
       });
     }
+
+    // OCR all uploaded files
+    const ocrResults = [];
+    for (const file of files) {
+      const result = await extractTNBBill(file.buffer, file.mimetype);
+
+      if (!result.success) {
+        return res.status(400).json({
+          success: false,
+          errorCode: 'OCR_FAILED',
+          isPdfAdvice: true,
+          message: req.user.language === 'BM'
+            ? 'Gagal membaca bil. Untuk ketepatan terbaik, muat naik bil dalam format PDF dari email TNB atau apl myTNB anda.'
+            : 'Failed to read bill. For best accuracy, upload your bill as PDF from your TNB email or myTNB app.'
+        });
+      }
+
+      // Validate billing month extracted
+      if (!result.data.billingMonth || result.data.billingMonth === 'YYYY-MM' || !/^\d{4}-\d{2}$/.test(result.data.billingMonth)) {
+        return res.status(400).json({
+          success: false,
+          errorCode: 'OCR_MONTH_FAILED',
+          isPdfAdvice: true,
+          message: req.user.language === 'BM'
+            ? 'Gagal mengesan bulan bil. Cuba muat naik sebagai PDF dari email TNB atau apl myTNB untuk ketepatan lebih baik.'
+            : 'Could not detect billing month. Try uploading as PDF from your TNB email or myTNB app for better accuracy.'
+        });
+      }
+
+      // Validate kWh extracted
+      if (!result.data.totalKwh || result.data.totalKwh <= 0) {
+        return res.status(400).json({
+          success: false,
+          errorCode: 'OCR_KWH_FAILED',
+          isPdfAdvice: true,
+          message: req.user.language === 'BM'
+            ? 'Gagal mengesan penggunaan kWh. Cuba muat naik sebagai PDF dari email TNB atau apl myTNB.'
+            : 'Could not detect kWh usage. Try uploading as PDF from your TNB email or myTNB app.'
+        });
+      }
+
+      // Validate cajSemasa extracted
+      if (!result.data.cajSemasa || result.data.cajSemasa <= 0) {
+        return res.status(400).json({
+          success: false,
+          errorCode: 'OCR_AMOUNT_FAILED',
+          isPdfAdvice: true,
+          message: req.user.language === 'BM'
+            ? 'Gagal mengesan jumlah bil semasa. Cuba muat naik sebagai PDF dari email TNB atau apl myTNB.'
+            : 'Could not detect current bill amount. Try uploading as PDF from your TNB email or myTNB app.'
+        });
+      }
+
+      ocrResults.push(result.data);
+    }
+
+    // Sort by billingMonth ascending
+    ocrResults.sort((a, b) => a.billingMonth.localeCompare(b.billingMonth));
+
+    // Chain validation — check months against DB
+    const uploadedMonths = ocrResults.map(r => r.billingMonth);
+    const chainValidation = await validateUploadedBills(
+      uploadedMonths,
+      req.user.id,
+      prisma,
+      req.user.language || 'EN'
+    );
+
+    if (!chainValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        errorCode: chainValidation.errorCode,
+        message: chainValidation.message
+      });
+    }
+
+    // Return OCR extracted values for user confirmation
+    // DO NOT save to DB yet
+    const latestOcr = ocrResults[ocrResults.length - 1];
+
+    console.log('Scan complete — awaiting user confirmation:', {
+      billingMonth: latestOcr.billingMonth,
+      totalKwh: latestOcr.totalKwh,
+      cajSemasa: latestOcr.cajSemasa,
+      confidence: latestOcr.billingMonthConfidence
+    });
+
+    res.json({
+      success: true,
+      requiresConfirmation: true,
+      chainStatus: chainStatus.status,
+      pricing,
+      // All OCR results for confirmation — user verifies these
+      ocrResults: ocrResults.map(ocr => ({
+        billingMonth: ocr.billingMonth,
+        billingPeriodStart: ocr.billingPeriodStart || null,
+        billingPeriodEnd: ocr.billingPeriodEnd || null,
+        billingPeriodDays: ocr.billingPeriodDays || 30,
+        totalKwh: ocr.totalKwh,
+        cajSemasa: ocr.cajSemasa || ocr.totalAmountMyr,
+        totalAmountMyr: ocr.totalAmountMyr,
+        tunggakan: ocr.tunggakan || 0,
+        confidence: ocr.billingMonthConfidence || 'HIGH',
+        // Full raw OCR for confirm endpoint
+        rawOcr: ocr
+      }))
+    });
+
+  } catch (error) {
+    console.error('Scan bills error:', error);
+    res.status(500).json({ success: false, message: 'Failed to scan bills' });
+  }
+};
+
+// ── NEW ENDPOINT 2 — CONFIRM & SAVE ──────────────────────
+// User confirmed OCR values are correct
+// NOW we save to DB, run engine, return teaser
+const confirmBills = async (req, res) => {
+  try {
+    // ocrResults = array of confirmed OCR data from FE
+    // User has verified these values match their physical bill
+    const { ocrResults } = req.body;
+
+    if (!ocrResults || !Array.isArray(ocrResults) || ocrResults.length === 0) {
+      return res.status(400).json({ success: false, message: 'No confirmed bill data received' });
+    }
+
+    // Get chain status + pricing
+    const chainStatus = await getChainStatus(req.user.id, prisma);
+    const pricing = getPricing(req.user.userType, chainStatus.status);
 
     // Get admin AFA rate as fallback
     const currentMonth = new Date().toISOString().slice(0, 7);
@@ -112,90 +244,51 @@ const uploadBills = async (req, res) => {
       where: { userId: req.user.id }
     });
 
-    // Step 1 — OCR all uploaded bills
-    const ocrResults = [];
-    for (const file of files) {
-      const result = await extractTNBBill(file.buffer, file.mimetype);
-      if (!result.success) {
-        return res.status(400).json({
-          success: false,
-          errorCode: 'OCR_FAILED',
-          message: req.user.language === 'BM'
-            ? `Gagal membaca bil. Sila pastikan gambar bil jelas dan cuba lagi.`
-            : `Failed to read bill. Please ensure the bill image is clear and try again.`
-        });
-      }
-
-      // Validate billingMonth extracted properly
-      if (!result.data.billingMonth || result.data.billingMonth === 'YYYY-MM') {
-        return res.status(400).json({
-          success: false,
-          errorCode: 'OCR_MONTH_FAILED',
-          message: req.user.language === 'BM'
-            ? `Gagal mengesan bulan bil. Sila pastikan gambar bil jelas menunjukkan Tempoh Bil.`
-            : `Failed to detect bill month. Please ensure the billing period is clearly visible.`
-        });
-      }
-
-      ocrResults.push(result.data);
-    }
-
     // Sort by billingMonth ascending
-    ocrResults.sort((a, b) => a.billingMonth.localeCompare(b.billingMonth));
-
-    // Step 2 — CRITICAL chain validation
-    // Validates month correctness, duplicates, old bills, wrong bills
-    const uploadedMonths = ocrResults.map(r => r.billingMonth);
-    const chainValidation = await validateUploadedBills(
-      uploadedMonths,
-      req.user.id,
-      prisma,
-      req.user.language || 'EN'
+    const sortedOcr = [...ocrResults].sort((a, b) =>
+      (a.rawOcr?.billingMonth || a.billingMonth).localeCompare(b.rawOcr?.billingMonth || b.billingMonth)
     );
 
-    if (!chainValidation.valid) {
-      console.log('Chain validation failed:', chainValidation.errorCode, chainValidation.message);
-      return res.status(400).json({
-        success: false,
-        errorCode: chainValidation.errorCode,
-        message: chainValidation.message
-      });
-    }
+    const latestOcr = sortedOcr[sortedOcr.length - 1];
+    const latestRaw = latestOcr.rawOcr || latestOcr;
 
-    // Use the LATEST bill for analysis
-    const latestOcr = ocrResults[ocrResults.length - 1];
-
-    // Step 3 — Build AFA components from OCR
-    let afaComponents = buildAfaComponents(latestOcr);
+    // Build AFA components
+    let afaComponents = buildAfaComponents(latestRaw);
     if (afaComponents.length === 0 && fallbackAfaRateSen !== 0) {
-      afaComponents = [{ rateSen: fallbackAfaRateSen, kwh: latestOcr.totalKwh, description: 'AFA', amountMyr: latestOcr.totalKwh * (fallbackAfaRateSen / 100) }];
+      afaComponents = [{
+        rateSen: fallbackAfaRateSen,
+        kwh: latestRaw.totalKwh,
+        description: 'AFA',
+        amountMyr: latestRaw.totalKwh * (fallbackAfaRateSen / 100)
+      }];
     }
 
-    // Step 4 — Run TNB math engine
+    // Run TNB engine — for effective rate only (used by bleeder)
     const billAnalysis = calculateTNBBill(
-      latestOcr.totalKwh,
+      latestRaw.totalKwh,
       afaComponents,
-      latestOcr.billingPeriodDays || 30
+      latestRaw.billingPeriodDays || 30
     );
 
-    // Step 5 — Run bleeder engine
+    // Run bleeder engine
     let bleederResult = null;
     let missions = [];
     if (appliances.length > 0) {
       bleederResult = analyseBleeders(
         appliances,
-        latestOcr.totalKwh,
+        latestRaw.totalKwh,
         billAnalysis.effectiveRateSen,
-        latestOcr.billingPeriodDays || 30
+        latestRaw.billingPeriodDays || 30
       );
       missions = generateMissions(bleederResult, billAnalysis, req.user.language);
     }
 
-    // Step 6 — Get previous bill for comparison
+    // Get previous bill for comparison
+    const latestBillingMonth = latestRaw.billingMonth;
     const previousRecord = await prisma.billingRecord.findFirst({
       where: {
         userId: req.user.id,
-        billingMonth: { lt: latestOcr.billingMonth }
+        billingMonth: { lt: latestBillingMonth }
       },
       orderBy: { billingMonth: 'desc' }
     });
@@ -209,11 +302,9 @@ const uploadBills = async (req, res) => {
           prevAfaComponents = buildAfaComponents(prevOcr);
         }
       } catch (e) {}
-
       if (prevAfaComponents.length === 0 && previousRecord.afaCharge && previousRecord.totalKwh > 0) {
         prevAfaComponents = [{ rateSen: (previousRecord.afaCharge / previousRecord.totalKwh) * 100, kwh: previousRecord.totalKwh }];
       }
-
       const prevAnalysis = calculateTNBBill(
         previousRecord.totalKwh,
         prevAfaComponents,
@@ -222,12 +313,12 @@ const uploadBills = async (req, res) => {
       comparison = compareBills(billAnalysis, prevAnalysis);
     }
 
-    // Step 7 — Calculate teaser amount
+    // Calculate teaser
     const teaserAmount = bleederResult
       ? bleederResult.totalPotentialSavingMyr
-      : round2(latestOcr.totalAmountMyr * 0.15);
+      : round2((latestRaw.cajSemasa || latestRaw.totalAmountMyr) * 0.15);
 
-    // Step 8 — Build report data
+    // Build report data
     const reportData = {
       billAutopsy: billAnalysis,
       bleeders: bleederResult,
@@ -237,11 +328,14 @@ const uploadBills = async (req, res) => {
       generatedAt: new Date().toISOString()
     };
 
-    // Step 9 — Save billing records
+    // Save billing records to DB
     const savedRecords = [];
-    for (const ocr of ocrResults) {
+    for (const item of sortedOcr) {
+      const ocr = item.rawOcr || item;
+      const billingMonth = ocr.billingMonth;
+
       const existing = await prisma.billingRecord.findFirst({
-        where: { userId: req.user.id, billingMonth: ocr.billingMonth }
+        where: { userId: req.user.id, billingMonth }
       });
 
       if (!existing) {
@@ -253,7 +347,7 @@ const uploadBills = async (req, res) => {
         const record = await prisma.billingRecord.create({
           data: {
             userId: req.user.id,
-            billingMonth: ocr.billingMonth,
+            billingMonth,
             billingPeriodDays: ocr.billingPeriodDays || 30,
             totalKwh: ocr.totalKwh,
             totalAmountMyr: ocr.cajSemasa || ocr.totalAmountMyr,
@@ -267,25 +361,32 @@ const uploadBills = async (req, res) => {
             kwtbbCharge: ocr.kwtbbCharge || 0,
             rawOcrText: JSON.stringify(ocr),
             isUnlocked: false,
-            reportData: ocr.billingMonth === latestOcr.billingMonth ? reportData : {},
-            teaserAmount: ocr.billingMonth === latestOcr.billingMonth ? teaserAmount : null
+            reportData: billingMonth === latestBillingMonth ? reportData : {},
+            teaserAmount: billingMonth === latestBillingMonth ? teaserAmount : null
           }
         });
         savedRecords.push(record);
       }
     }
 
-    const latestRecord = savedRecords.find(r => r.billingMonth === latestOcr.billingMonth)
+    const latestRecord = savedRecords.find(r => r.billingMonth === latestBillingMonth)
       || await prisma.billingRecord.findFirst({
-        where: { userId: req.user.id, billingMonth: latestOcr.billingMonth }
+        where: { userId: req.user.id, billingMonth: latestBillingMonth }
       });
+
+    console.log('Bills confirmed and saved:', {
+      userId: req.user.id,
+      billingMonth: latestBillingMonth,
+      recordId: latestRecord?.id,
+      teaserAmount
+    });
 
     res.json({
       success: true,
       teaser: {
-        billingMonth: latestOcr.billingMonth,
-        totalKwh: latestOcr.totalKwh,
-        totalAmountMyr: latestOcr.cajSemasa || latestOcr.totalAmountMyr,
+        billingMonth: latestBillingMonth,
+        totalKwh: latestRaw.totalKwh,
+        totalAmountMyr: latestRaw.cajSemasa || latestRaw.totalAmountMyr,
         estimatedOverspendMyr: teaserAmount,
         topBleederType: bleederResult?.topBleeder?.applianceType || null,
         recordId: latestRecord?.id || null
@@ -295,10 +396,13 @@ const uploadBills = async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Upload bills error:', error);
-    res.status(500).json({ success: false, message: 'Failed to process bills' });
+    console.error('Confirm bills error:', error);
+    res.status(500).json({ success: false, message: 'Failed to confirm bills' });
   }
 };
+
+// Keep uploadBills as alias for backward compatibility
+const uploadBills = scanBills;
 
 const getBillingHistory = async (req, res) => {
   try {
@@ -322,4 +426,12 @@ const getBillingHistory = async (req, res) => {
   }
 };
 
-module.exports = { upload, saveAppliances, getChainInfo, uploadBills, getBillingHistory };
+module.exports = {
+  upload,
+  saveAppliances,
+  getChainInfo,
+  scanBills,
+  confirmBills,
+  uploadBills, // backward compat
+  getBillingHistory
+};
