@@ -4,32 +4,31 @@ const { analyseBleeders, generateMissions } = require('../engine/bleederEngine')
 
 const prisma = new PrismaClient();
 
-// Rebuild AFA components from stored raw OCR data
 const rebuildAfaComponents = (record) => {
   try {
-    // Try to get AFA components from stored rawOcrText
     if (record.rawOcrText) {
       const ocr = JSON.parse(record.rawOcrText);
       if (ocr.afaComponents && Array.isArray(ocr.afaComponents) && ocr.afaComponents.length > 0) {
         return ocr.afaComponents;
       }
     }
-  } catch (e) {
-    // ignore parse errors
-  }
-
-  // Fallback — reconstruct from stored afaCharge
+  } catch (e) {}
   if (record.afaCharge && record.totalKwh > 0) {
     const rateSen = (record.afaCharge / record.totalKwh) * 100;
     return [{ rateSen: Math.round(rateSen * 100) / 100, kwh: record.totalKwh, description: 'AFA', amountMyr: record.afaCharge }];
   }
-
   return [];
+};
+
+const getOcrData = (record) => {
+  try {
+    if (record.rawOcrText) return JSON.parse(record.rawOcrText);
+  } catch (e) {}
+  return {};
 };
 
 const round2 = (val) => Math.round(val * 100) / 100;
 
-// Get full unlocked report
 const getReport = async (req, res) => {
   try {
     const { recordId } = req.params;
@@ -50,12 +49,15 @@ const getReport = async (req, res) => {
       });
     }
 
+    // Get OCR data — source of truth for Bill Autopsy
+    const ocrData = getOcrData(record);
+
     // Get appliances
     const appliances = await prisma.appliance.findMany({
       where: { userId: req.user.id }
     });
 
-    // Rebuild AFA components from stored OCR data
+    // Rebuild AFA components
     const afaComponents = rebuildAfaComponents(record);
 
     // Get admin AFA rate as fallback
@@ -63,14 +65,14 @@ const getReport = async (req, res) => {
       where: { month: record.billingMonth }
     });
 
-    // Use OCR AFA components if available, else use admin rate
     const afaForEngine = afaComponents.length > 0
       ? afaComponents
       : afaRecord
-        ? [{ rateSen: afaRecord.rateSen, kwh: record.totalKwh, description: 'AFA', amountMyr: record.totalKwh * (afaRecord.rateSen / 100) }]
+        ? [{ rateSen: afaRecord.rateSen, kwh: record.totalKwh }]
         : [];
 
-    // Recalculate fresh with correct AFA
+    // Engine ONLY for effective rate + bleeder analysis
+    // NOT used for Bill Autopsy display
     const billAnalysis = calculateTNBBill(
       record.totalKwh,
       afaForEngine,
@@ -111,7 +113,6 @@ const getReport = async (req, res) => {
         : prevAfaRecord
           ? [{ rateSen: prevAfaRecord.rateSen, kwh: previousRecord.totalKwh }]
           : [];
-
       const previousBillAnalysis = calculateTNBBill(
         previousRecord.totalKwh,
         prevAfaForEngine,
@@ -120,7 +121,7 @@ const getReport = async (req, res) => {
       comparison = compareBills(billAnalysis, previousBillAnalysis);
     }
 
-    // AFA Watch — next month
+    // AFA Watch
     const nextMonth = getNextMonth(record.billingMonth);
     const nextAfaRecord = await prisma.afaRate.findFirst({
       where: { month: nextMonth }
@@ -146,45 +147,65 @@ const getReport = async (req, res) => {
     const totalPotentialSaved = allRecords.reduce((sum, r) => sum + (r.teaserAmount || 0), 0);
     const totalPaidToJimat = totalPayments._sum.amountMyr || 0;
 
-    // Calculate net AFA rate for display
+    // ── BILL AUTOPSY — 100% FROM OCR ─────────────────────
+    // All values direct from OCR — no engine recalculation
+    // cajSemasa = current month charges only (excludes arrears)
+    const cajSemasa = ocrData.cajSemasa || record.totalAmountMyr;
+    const effectiveRateSen = record.totalKwh > 0
+      ? round2((cajSemasa / record.totalKwh) * 100)
+      : 0;
+
+    // AFA net charge from OCR
+    const afaNetCharge = ocrData.afaCharge !== undefined
+      ? ocrData.afaCharge
+      : record.afaCharge || 0;
+
+    // Flags based on actual usage
+    const excessKwh = Math.max(record.totalKwh - 600, 0);
+    const flags = {
+      retailChargeWaived: excessKwh === 0,
+      aboveThreshold: excessKwh > 0,
+      aboveHighTier: record.totalKwh > 1500,
+      eeiApplied: true,
+      nearRetailThreshold: record.totalKwh > 540 && record.totalKwh <= 600,
+      excessKwh
+    };
+
+    // Net AFA rate for display
     const netAfaRateSen = afaComponents.length > 0
-      ? afaComponents.reduce((sum, c) => sum + c.rateSen, 0)
+      ? round2(afaComponents.reduce((sum, c) => sum + c.rateSen, 0))
       : afaRecord ? afaRecord.rateSen : 0;
 
-    // Build full report
     const report = {
-      // Screen 1 — Bill Autopsy
+      // Screen 1 — Bill Autopsy (100% OCR values)
       billAutopsy: {
         billingMonth: record.billingMonth,
         billingPeriodDays: record.billingPeriodDays || 30,
+        billingPeriodStart: ocrData.billingPeriodStart || null,
+        billingPeriodEnd: ocrData.billingPeriodEnd || null,
         totalKwh: record.totalKwh,
-        totalAmountMyr: record.totalAmountMyr,
+        cajSemasa,
+        totalAmountMyr: ocrData.totalAmountMyr || record.totalAmountMyr,
+        tunggakan: ocrData.tunggakan || 0,
+        latePaymentCharge: ocrData.latePaymentCharge || 0,
+        effectiveRateSen,
         breakdown: {
-          generationCharge: billAnalysis.generationCharge,
-          capacityCharge: billAnalysis.capacityCharge,
-          networkCharge: billAnalysis.networkCharge,
-          retailCharge: billAnalysis.retailCharge,
-          afaCharge: billAnalysis.afaCharge,
-          afaComponents: afaComponents,
-          eeRebate: billAnalysis.eeRebate,
-          kwtbbCharge: billAnalysis.kwtbbCharge,
-          sstCharge: billAnalysis.sstCharge
+          // All from OCR — exactly as on TNB bill
+          generationCharge: ocrData.generationCharge || record.generationCharge || 0,
+          capacityCharge: ocrData.capacityCharge || record.capacityCharge || 0,
+          networkCharge: ocrData.networkCharge || record.networkCharge || 0,
+          retailCharge: ocrData.retailCharge || record.retailCharge || 0,
+          afaCharge: afaNetCharge,
+          afaComponents: ocrData.afaComponents || afaComponents || [],
+          eeRebate: ocrData.eeRebate || record.eeRebate || 0,
+          kwtbbCharge: ocrData.kwtbbCharge || record.kwtbbCharge || 0,
+          sstCharge: ocrData.sstCharge || record.sstCharge || 0,
+          latePaymentCharge: ocrData.latePaymentCharge || 0
         },
-        effectiveRateSen: billAnalysis.effectiveRateSen,
-        calculatedTotal: billAnalysis.totalBill,
-        flags: billAnalysis.flags,
-        // Accuracy check
-        accuracy: {
-          calculated: billAnalysis.totalBill,
-          actual: record.totalAmountMyr,
-          difference: round2(Math.abs(billAnalysis.totalBill - record.totalAmountMyr)),
-          percentDiff: record.totalAmountMyr > 0
-            ? round2(Math.abs((billAnalysis.totalBill - record.totalAmountMyr) / record.totalAmountMyr) * 100)
-            : 0
-        }
+        flags
       },
 
-      // Screen 2 — The Bleeder
+      // Screen 2 — Bleeder
       bleeder: bleederResult ? {
         topBleeder: bleederResult.topBleeder,
         allBleeders: bleederResult.bleeders,
@@ -192,7 +213,7 @@ const getReport = async (req, res) => {
         coveragePercent: bleederResult.coveragePercent
       } : null,
 
-      // Screen 3 — Monthly Missions
+      // Screen 3 — Missions
       missions,
 
       // Screen 4 — Month vs Month
@@ -201,6 +222,8 @@ const getReport = async (req, res) => {
         previousMonth: previousRecord?.billingMonth || null,
         currentKwh: record.totalKwh,
         previousKwh: previousRecord?.totalKwh || null,
+        currentAmount: cajSemasa,
+        previousAmount: previousRecord?.totalAmountMyr || null,
         kwhDiff: comparison.kwhDiff,
         amountDiff: comparison.amountDiff,
         kwhChangePercent: comparison.kwhChangePercent,
@@ -231,7 +254,6 @@ const getReport = async (req, res) => {
         history: allRecords
       },
 
-      // Disclaimer
       disclaimer: {
         EN: 'This analysis is based on your declared appliance usage and TNB published tariff rates. Actual savings may vary depending on real usage patterns. AWAS Premium Resources does not guarantee specific bill reductions.',
         BM: 'Analisis ini berdasarkan penggunaan peralatan yang anda isytiharkan dan kadar tarif TNB yang diterbitkan. Penjimatan sebenar mungkin berbeza bergantung kepada corak penggunaan sebenar. AWAS Premium Resources tidak menjamin pengurangan bil yang spesifik.'
@@ -245,36 +267,22 @@ const getReport = async (req, res) => {
   }
 };
 
-// Get teaser only — pre-payment
 const getTeaser = async (req, res) => {
   try {
     const { recordId } = req.params;
-
     const record = await prisma.billingRecord.findFirst({
       where: { id: recordId, userId: req.user.id },
       select: {
-        id: true,
-        billingMonth: true,
-        totalKwh: true,
-        totalAmountMyr: true,
-        isUnlocked: true,
-        teaserAmount: true
+        id: true, billingMonth: true, totalKwh: true,
+        totalAmountMyr: true, isUnlocked: true, teaserAmount: true
       }
     });
-
     if (!record) {
       return res.status(404).json({ success: false, message: 'Record not found' });
     }
-
     if (record.isUnlocked) {
-      return res.json({
-        success: true,
-        isUnlocked: true,
-        recordId: record.id,
-        message: 'Report already unlocked'
-      });
+      return res.json({ success: true, isUnlocked: true, recordId: record.id, message: 'Report already unlocked' });
     }
-
     res.json({
       success: true,
       isUnlocked: false,
