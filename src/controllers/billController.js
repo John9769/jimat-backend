@@ -306,7 +306,8 @@ const confirmBills = async (req, res) => {
         actualEffectiveRateSen,
         reportRaw.billingPeriodDays || 30
       );
-      missions = generateMissions(bleederResult, billAnalysis, req.user.language);
+      const missionResult = generateMissions(bleederResult, billAnalysis, req.user.language);
+missions = missionResult;
     }
 
     if (req.user.userType === 'INSTITUTIONAL' && appliancesToUse.length > 0) {

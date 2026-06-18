@@ -118,10 +118,11 @@ const getReport = async (req, res) => {
         actualEffectiveRateSen,
         record.billingPeriodDays || 30
       );
-      missions = generateMissions(bleederResult, {
+      const missionResult = generateMissions(bleederResult, {
         ...billAnalysis,
         effectiveRateSen: actualEffectiveRateSen
       }, req.user.language);
+      missions = missionResult;
     }
 
     if (req.user.userType === 'INSTITUTIONAL' && appliancesToUse.length > 0) {
