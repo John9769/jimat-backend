@@ -16,7 +16,13 @@ const protect = async (req, res, next) => {
         id: true,
         email: true,
         name: true,
+        phone: true,
         userType: true,
+        orgName: true,
+        postcode: true,
+        township: true,
+        state: true,
+        housingType: true,
         language: true,
         isActive: true,
         institutionType: true,
@@ -26,7 +32,8 @@ const protect = async (req, res, next) => {
         floorAreaCategory: true,
         lightType: true,
         chainStatus: true,
-        lastBillingMonth: true
+        lastBillingMonth: true,
+        chainBrokenAt: true
       }
     });
     if (!user || !user.isActive) {
