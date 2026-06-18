@@ -2,7 +2,7 @@ const { PrismaClient } = require('@prisma/client');
 const multer = require('multer');
 const { extractTNBBill } = require('../utils/ocr');
 const { calculateTNBBill } = require('../engine/tnbEngine');
-const { analyseBleeders, generateMissions, generateInstitutionalProfile, calculateInstitutionalWaste } = require('../engine/bleederEngine');
+const { analyseBleeders, generateMissions, generateInstitutionalProfile, calculateInstitutionalWaste, calculateTeaserRange } = require('../engine/bleederEngine');
 const { calculateHealthScore, calculateMissionTarget } = require('../engine/healthEngine');
 const {
   getChainStatus,
@@ -85,7 +85,6 @@ const getChainInfo = async (req, res) => {
 };
 
 // ── SCAN BILLS ────────────────────────────────────────────
-// OCR only — NO DB save — returns values for user confirmation
 const scanBills = async (req, res) => {
   try {
     const files = req.files;
@@ -96,7 +95,6 @@ const scanBills = async (req, res) => {
     const chainStatus = await getChainStatus(req.user.id, prisma);
     const pricing = getPricing(req.user.userType, chainStatus.status);
 
-    // File count check
     if (chainStatus.billsRequired === 2 && files.length < 2) {
       return res.status(400).json({
         success: false,
@@ -111,7 +109,6 @@ const scanBills = async (req, res) => {
       });
     }
 
-    // OCR all files
     const ocrResults = [];
     for (const file of files) {
       const result = await extractTNBBill(file.buffer, file.mimetype);
@@ -163,10 +160,8 @@ const scanBills = async (req, res) => {
       ocrResults.push(result.data);
     }
 
-    // Sort ascending
     ocrResults.sort((a, b) => a.billingMonth.localeCompare(b.billingMonth));
 
-    // Chain validation
     const uploadedMonths = ocrResults.map(r => r.billingMonth);
     const chainValidation = await validateUploadedBills(
       uploadedMonths,
@@ -183,21 +178,8 @@ const scanBills = async (req, res) => {
       });
     }
 
-    // Determine roles — which bill is reference, which is report
     const ocrWithRoles = determineRoles(chainValidation, ocrResults);
 
-    console.log('Scan complete — awaiting confirmation:', {
-      roles: ocrWithRoles.map(o => ({
-        month: o.billingMonth,
-        isReference: o.isReference,
-        kWh: o.totalKwh,
-        cajSemasa: o.cajSemasa
-      }))
-    });
-
-    // Return for user confirmation
-    // Show ONLY the report bill details for confirmation
-    // Reference bill shown minimally
     const reportBill = ocrWithRoles.find(o => !o.isReference);
     const referenceBill = ocrWithRoles.find(o => o.isReference);
 
@@ -221,7 +203,6 @@ const scanBills = async (req, res) => {
         referenceMonth: ocr.referenceMonth || null,
         rawOcr: ocr
       })),
-      // Summary for confirm screen
       summary: {
         reportMonth: reportBill?.billingMonth || null,
         referenceMonth: referenceBill?.billingMonth || chainValidation.referenceBill || null,
@@ -237,10 +218,6 @@ const scanBills = async (req, res) => {
 };
 
 // ── CONFIRM BILLS ─────────────────────────────────────────
-// User confirmed OCR values
-// Save to DB with 2-bill 1-report logic
-// Calculate health score + mission target
-// Update User.chainStatus
 const confirmBills = async (req, res) => {
   try {
     const { ocrResults } = req.body;
@@ -252,27 +229,22 @@ const confirmBills = async (req, res) => {
     const chainStatus = await getChainStatus(req.user.id, prisma);
     const pricing = getPricing(req.user.userType, chainStatus.status);
 
-    // Get admin AFA rate as fallback
     const currentMonth = new Date().toISOString().slice(0, 7);
     const afaRecord = await prisma.afaRate.findFirst({
       where: { month: currentMonth }
     });
     const fallbackAfaRateSen = afaRecord ? afaRecord.rateSen : 0;
 
-    // Get user appliances
     const appliances = await prisma.appliance.findMany({
       where: { userId: req.user.id }
     });
 
-    // Sort ascending
     const sortedOcr = [...ocrResults].sort((a, b) => {
       const aMonth = getOcrData(a).billingMonth;
       const bMonth = getOcrData(b).billingMonth;
       return aMonth.localeCompare(bMonth);
     });
 
-    // Identify reference vs report bills
-    // isReference comes from scanBills determination
     const referenceBillItem = sortedOcr.find(o => o.isReference === true);
     const reportBillItem = sortedOcr.find(o => o.isReference === false) || sortedOcr[sortedOcr.length - 1];
 
@@ -280,15 +252,7 @@ const confirmBills = async (req, res) => {
     const referenceRaw = referenceBillItem ? getOcrData(referenceBillItem) : null;
     const latestBillingMonth = reportRaw.billingMonth;
 
-    console.log('Confirm bills:', {
-      reportMonth: latestBillingMonth,
-      referenceMonth: referenceRaw?.billingMonth || reportBillItem.referenceMonth,
-      isReference: referenceBillItem ? true : false
-    });
-
     // ── GET REFERENCE RECORD ──────────────────────────────
-    // For MONTHLY users — reference is in DB
-    // For ONBOARD/RESET — reference is the first uploaded bill
     let referenceRecord = null;
     const referenceMonth = referenceRaw?.billingMonth || reportBillItem.referenceMonth;
 
@@ -298,11 +262,10 @@ const confirmBills = async (req, res) => {
       });
     }
 
-    // Get reference OCR data for comparison
     const referenceOcrData = referenceRaw ||
       (referenceRecord?.rawOcrText ? JSON.parse(referenceRecord.rawOcrText) : null);
 
-    // ── BUILD AFA COMPONENTS ──────────────────────────────
+    // ── AFA COMPONENTS ────────────────────────────────────
     let afaComponents = buildAfaComponents(reportRaw);
     if (afaComponents.length === 0 && fallbackAfaRateSen !== 0) {
       afaComponents = [{
@@ -313,13 +276,13 @@ const confirmBills = async (req, res) => {
       }];
     }
 
-    // ── EFFECTIVE RATE — FROM ACTUAL BILL ─────────────────
+    // ── EFFECTIVE RATE ────────────────────────────────────
     const reportCajSemasa = reportRaw.cajSemasa || reportRaw.totalAmountMyr;
     const actualEffectiveRateSen = reportRaw.totalKwh > 0
       ? round2((reportCajSemasa / reportRaw.totalKwh) * 100)
       : 0;
 
-    // ── ENGINE — for flags only ───────────────────────────
+    // ── ENGINE FLAGS ──────────────────────────────────────
     const billAnalysis = calculateTNBBill(
       reportRaw.totalKwh,
       afaComponents,
@@ -327,7 +290,6 @@ const confirmBills = async (req, res) => {
     );
 
     // ── BLEEDER ENGINE ────────────────────────────────────
-    // For INSTITUTIONAL — generate profile from onboarding answers if no appliances
     let appliancesToUse = appliances;
     if (req.user.userType === 'INSTITUTIONAL' && appliances.length === 0) {
       appliancesToUse = generateInstitutionalProfile(req.user);
@@ -347,7 +309,6 @@ const confirmBills = async (req, res) => {
       missions = generateMissions(bleederResult, billAnalysis, req.user.language);
     }
 
-    // For INSTITUTIONAL — calculate expected vs actual kWh waste
     if (req.user.userType === 'INSTITUTIONAL' && appliancesToUse.length > 0) {
       institutionalWaste = calculateInstitutionalWaste(
         appliancesToUse,
@@ -372,19 +333,46 @@ const confirmBills = async (req, res) => {
       lang: req.user.language || 'EN'
     });
 
-    console.log('Health score calculated:', {
-      score: healthResult.score,
-      band: healthResult.band,
-      factors: Object.entries(healthResult.factors).map(([k, v]) => `${k}:${v.score}`)
-    });
-
-    // ── MISSION KWH TARGET ────────────────────────────────
+    // ── MISSION TARGET ────────────────────────────────────
     const missionKwhTarget = calculateMissionTarget(reportRaw.totalKwh);
 
-    // ── TEASER AMOUNT ─────────────────────────────────────
-    const teaserAmount = bleederResult
-      ? bleederResult.totalPotentialSavingMyr
-      : round2(reportCajSemasa * 0.15);
+    // ── TEASER RANGE — NEW DYNAMIC ALGO ──────────────────
+    // Requires both bills + appliances + TNB tariff math
+    // Falls back to bleeder total if no reference bill available
+    let teaserLow = 0;
+    let teaserHigh = 0;
+    let teaserMessage = '';
+    let teaserMessageBM = '';
+
+    const bill1Kwh = referenceOcrData?.totalKwh || null;
+    const bill1CajSemasa = referenceOcrData?.cajSemasa || referenceOcrData?.totalAmountMyr || null;
+
+    if (bill1Kwh && bill1CajSemasa && appliancesToUse.length > 0) {
+      // Full dynamic teaser — both bills + appliances
+      const teaserResult = calculateTeaserRange(
+        bill1Kwh,
+        reportRaw.totalKwh,
+        bill1CajSemasa,
+        reportCajSemasa,
+        appliancesToUse,
+        actualEffectiveRateSen,
+        reportRaw.billingPeriodDays || 30
+      );
+      teaserLow = teaserResult.teaserLow;
+      teaserHigh = teaserResult.teaserHigh;
+      teaserMessage = teaserResult.teaserMessage;
+      teaserMessageBM = teaserResult.teaserMessageBM;
+    } else if (bleederResult) {
+      // Fallback — appliances only, no reference bill
+      teaserLow = round2(bleederResult.totalPotentialSavingMyr * 0.6);
+      teaserHigh = bleederResult.totalPotentialSavingMyr;
+      teaserMessage = `Your report shows RM${teaserLow} – RM${teaserHigh} in potential savings from your declared appliances.`;
+      teaserMessageBM = `Laporan anda menunjukkan RM${teaserLow} – RM${teaserHigh} potensi penjimatan daripada peralatan yang anda isytiharkan.`;
+    }
+
+    // Coverage gap from bleeder result
+    const coverageGapKwh = bleederResult?.coverageGapKwh || 0;
+    const coveragePercent = bleederResult?.coveragePercent || 0;
 
     // ── REPORT DATA ───────────────────────────────────────
     const reportData = {
@@ -394,9 +382,6 @@ const confirmBills = async (req, res) => {
     };
 
     // ── SAVE BILLING RECORDS ──────────────────────────────
-    // 2-BILL 1-REPORT LOGIC:
-    // Reference bill → isReference: true, no teaserAmount, no payment needed
-    // Report bill → isReference: false, has teaserAmount, payment required
     const savedRecords = [];
 
     for (const item of sortedOcr) {
@@ -425,7 +410,7 @@ const confirmBills = async (req, res) => {
             billingPeriodEnd: ocr.billingPeriodEnd || null,
             totalKwh: ocr.totalKwh,
             totalAmountMyr: ocr.totalAmountMyr || cajSemasa,
-            cajSemasa: cajSemasa,
+            cajSemasa,
             tunggakan: ocr.tunggakan || 0,
             generationCharge: ocr.generationCharge || 0,
             capacityCharge: ocr.capacityCharge || 0,
@@ -438,16 +423,19 @@ const confirmBills = async (req, res) => {
             latePaymentCharge: ocr.latePaymentCharge || 0,
             rawOcrText: JSON.stringify(ocr),
 
-            // ── 2-BILL 1-REPORT ──────────────────────────
             isReference: isRef,
             referenceMonth: isRef ? null : (referenceRaw?.billingMonth || item.referenceMonth || null),
-
-            // Reference bill = locked forever (no payment, no unlock)
-            // Report bill = locked until payment
             isUnlocked: false,
 
-            // Only report bill has teaser + health score
-            teaserAmount: isRef ? null : teaserAmount,
+            // TEASER RANGE — only on report bill
+            teaserLow: isRef ? null : teaserLow,
+            teaserHigh: isRef ? null : teaserHigh,
+
+            // COVERAGE GAP — only on report bill
+            coverageGapKwh: isRef ? null : coverageGapKwh,
+            coveragePercent: isRef ? null : coveragePercent,
+
+            // HEALTH SCORE — only on report bill
             healthScore: isRef ? null : healthResult.score,
             healthBand: isRef ? null : healthResult.band,
             healthScoreThreshold: isRef ? null : healthResult.factors.threshold.score,
@@ -456,15 +444,12 @@ const confirmBills = async (req, res) => {
             healthScoreAfa: isRef ? null : healthResult.factors.afa.score,
             healthScoreCause: isRef ? null : healthResult.factors.cause.score,
 
-            // Institutional waste fields
+            // INSTITUTIONAL
             expectedKwhMonthly: isRef ? null : (institutionalWaste?.expectedKwhMonthly || null),
             wastedKwhMonthly: isRef ? null : (institutionalWaste?.wastedKwhMonthly || null),
             wastedAmountMyr: isRef ? null : (institutionalWaste?.wastedAmountMyr || null),
 
-            // Mission target for next month
             missionKwhTarget: isRef ? null : missionKwhTarget,
-            missionsData: isRef ? null : (missions.length > 0 ? missions : null),
-
             reportData: isRef ? null : reportData
           }
         });
@@ -472,8 +457,7 @@ const confirmBills = async (req, res) => {
       }
     }
 
-    // ── UPDATE PREVIOUS RECORD MISSION COMPLETION ─────────
-    // If this is a loyal upload — check if previous mission was completed
+    // ── MISSION COMPLETION CHECK ──────────────────────────
     if (chainStatus.status === 'MONTHLY' && referenceRecord && referenceRecord.missionKwhTarget) {
       const missionCompleted = reportRaw.totalKwh <= referenceRecord.missionKwhTarget;
       await prisma.billingRecord.update({
@@ -483,37 +467,20 @@ const confirmBills = async (req, res) => {
           missionCompleted
         }
       });
-      console.log('Mission completion updated:', {
-        referenceMonth: referenceRecord.billingMonth,
-        target: referenceRecord.missionKwhTarget,
-        actual: reportRaw.totalKwh,
-        completed: missionCompleted
-      });
     }
 
-    // ── UPDATE USER CHAIN STATUS ──────────────────────────
+    // ── UPDATE CHAIN STATUS ───────────────────────────────
     await updateUserChainStatus(
       req.user.id,
-      'MONTHLY', // After successful save — user is now loyal
+      'MONTHLY',
       latestBillingMonth,
       prisma
     );
 
-    // ── GET LATEST RECORD ─────────────────────────────────
     const latestRecord = savedRecords.find(r => r.billingMonth === latestBillingMonth)
       || await prisma.billingRecord.findFirst({
         where: { userId: req.user.id, billingMonth: latestBillingMonth }
       });
-
-    console.log('Bills confirmed and saved successfully:', {
-      userId: req.user.id,
-      reportMonth: latestBillingMonth,
-      referenceMonth: referenceRaw?.billingMonth,
-      recordId: latestRecord?.id,
-      healthScore: healthResult.score,
-      teaserAmount,
-      missionTarget: missionKwhTarget
-    });
 
     res.json({
       success: true,
@@ -522,10 +489,13 @@ const confirmBills = async (req, res) => {
         referenceMonth: referenceRaw?.billingMonth || null,
         totalKwh: reportRaw.totalKwh,
         totalAmountMyr: reportCajSemasa,
-        estimatedOverspendMyr: teaserAmount,
+        teaserLow,
+        teaserHigh,
+        teaserMessage: req.user.language === 'BM' ? teaserMessageBM : teaserMessage,
+        coverageGapKwh,
+        coveragePercent,
         topBleederType: bleederResult?.topBleeder?.applianceType || null,
         recordId: latestRecord?.id || null,
-        // Health score preview in teaser
         healthScore: healthResult.score,
         healthBand: healthResult.band,
         healthBandEmoji: healthResult.bandEmoji,
@@ -541,18 +511,15 @@ const confirmBills = async (req, res) => {
   }
 };
 
-// Keep uploadBills as alias for backward compatibility
 const uploadBills = scanBills;
 
 // ── GET BILLING HISTORY ───────────────────────────────────
-// Only return non-reference records
-// Reference bills are hidden from users
 const getBillingHistory = async (req, res) => {
   try {
     const records = await prisma.billingRecord.findMany({
       where: {
         userId: req.user.id,
-        isReference: false  // ← Hide reference bills from history
+        isReference: false
       },
       orderBy: { billingMonth: 'desc' },
       select: {
@@ -563,7 +530,10 @@ const getBillingHistory = async (req, res) => {
         cajSemasa: true,
         totalAmountMyr: true,
         isUnlocked: true,
-        teaserAmount: true,
+        teaserLow: true,
+        teaserHigh: true,
+        coverageGapKwh: true,
+        coveragePercent: true,
         healthScore: true,
         healthBand: true,
         missionCompleted: true,

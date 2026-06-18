@@ -249,7 +249,8 @@ const checkPaymentStatus = async (req, res) => {
         id: true,
         billingMonth: true,
         isUnlocked: true,
-        teaserAmount: true,
+        teaserLow: true,
+        teaserHigh: true,
         payment: {
           select: {
             status: true,
