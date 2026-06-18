@@ -2,7 +2,7 @@ const { PrismaClient } = require('@prisma/client');
 const multer = require('multer');
 const { extractTNBBill } = require('../utils/ocr');
 const { calculateTNBBill } = require('../engine/tnbEngine');
-const { analyseBleeders, generateMissions } = require('../engine/bleederEngine');
+const { analyseBleeders, generateMissions, generateInstitutionalProfile, calculateInstitutionalWaste } = require('../engine/bleederEngine');
 const { calculateHealthScore, calculateMissionTarget } = require('../engine/healthEngine');
 const {
   getChainStatus,
@@ -327,16 +327,34 @@ const confirmBills = async (req, res) => {
     );
 
     // ── BLEEDER ENGINE ────────────────────────────────────
+    // For INSTITUTIONAL — generate profile from onboarding answers if no appliances
+    let appliancesToUse = appliances;
+    if (req.user.userType === 'INSTITUTIONAL' && appliances.length === 0) {
+      appliancesToUse = generateInstitutionalProfile(req.user);
+    }
+
     let bleederResult = null;
     let missions = [];
-    if (appliances.length > 0) {
+    let institutionalWaste = null;
+
+    if (appliancesToUse.length > 0) {
       bleederResult = analyseBleeders(
-        appliances,
+        appliancesToUse,
         reportRaw.totalKwh,
         actualEffectiveRateSen,
         reportRaw.billingPeriodDays || 30
       );
       missions = generateMissions(bleederResult, billAnalysis, req.user.language);
+    }
+
+    // For INSTITUTIONAL — calculate expected vs actual kWh waste
+    if (req.user.userType === 'INSTITUTIONAL' && appliancesToUse.length > 0) {
+      institutionalWaste = calculateInstitutionalWaste(
+        appliancesToUse,
+        reportRaw.totalKwh,
+        actualEffectiveRateSen,
+        reportRaw.billingPeriodDays || 30
+      );
     }
 
     // ── HEALTH SCORE ──────────────────────────────────────
@@ -437,6 +455,11 @@ const confirmBills = async (req, res) => {
             healthScoreBleeder: isRef ? null : healthResult.factors.bleeder.score,
             healthScoreAfa: isRef ? null : healthResult.factors.afa.score,
             healthScoreCause: isRef ? null : healthResult.factors.cause.score,
+
+            // Institutional waste fields
+            expectedKwhMonthly: isRef ? null : (institutionalWaste?.expectedKwhMonthly || null),
+            wastedKwhMonthly: isRef ? null : (institutionalWaste?.wastedKwhMonthly || null),
+            wastedAmountMyr: isRef ? null : (institutionalWaste?.wastedAmountMyr || null),
 
             // Mission target for next month
             missionKwhTarget: isRef ? null : missionKwhTarget,

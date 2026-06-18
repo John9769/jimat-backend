@@ -20,7 +20,15 @@ const protect = async (req, res, next) => {
         name: true,
         userType: true,
         language: true,
-        isActive: true
+        isActive: true,
+        institutionType: true,
+        aircondSystemType: true,
+        centralAircondSize: true,
+        buildingAge: true,
+        floorAreaCategory: true,
+        lightType: true,
+        chainStatus: true,
+        lastBillingMonth: true
       }
     });
 

@@ -12,6 +12,25 @@ enum UserType {
   INSTITUTIONAL
 }
 
+enum InstitutionType {
+  MASJID
+  SURAU
+  SEKOLAH
+  OTHERS
+}
+
+enum AircondSystemType {
+  SPLIT    // Individual split units — use HP
+  CENTRAL  // Central chiller — use RT
+}
+
+enum CentralAircondSize {
+  SMALL       // 10-20 RT — surau kecil
+  MEDIUM      // 20-50 RT — masjid biasa
+  LARGE       // 50-100 RT — masjid negeri
+  VERY_LARGE  // >100 RT — kompleks masjid
+}
+
 enum PaymentType {
   ONBOARD
   MONTHLY
@@ -26,6 +45,7 @@ enum PaymentStatus {
 
 enum ApplianceType {
   AIRCOND
+  CENTRAL_AIRCOND  // Central chiller system — institutional only
   WATER_HEATER
   REFRIGERATOR
   WASHING_MACHINE
@@ -56,33 +76,55 @@ enum HealthBand {
 }
 
 model User {
-  id              String        @id @default(cuid())
-  email           String        @unique
+  id              String          @id @default(cuid())
+  email           String          @unique
   password        String
   name            String
   phone           String?
-  userType        UserType      @default(HOUSEHOLD)
+  userType        UserType        @default(HOUSEHOLD)
   orgName         String?
   postcode        String?
   township        String?
   state           String?
-  housingType     String?
-  language        String        @default("EN")
-  isActive        Boolean       @default(true)
+  language        String          @default("EN")
+  isActive        Boolean         @default(true)
 
-  // Chain tracking at user level
-  // Denormalised for fast chain status checks
-  // Updated every time a new billing record is saved
-  chainStatus     ChainStatus   @default(ONBOARD)
-  lastBillingMonth String?      // YYYY-MM of most recent saved bill
-  chainBrokenAt   DateTime?     // When chain last broke
+  // ── HOUSEHOLD ONLY ──────────────────────────────────────
+  housingType     String?         // Terrace/Apartment/Semi-D/Bungalow
 
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
+  // ── INSTITUTIONAL ONLY ──────────────────────────────────
+  institutionType InstitutionType?  // MASJID/SURAU/SEKOLAH/OTHERS
 
-  appliances      Appliance[]
-  billingRecords  BillingRecord[]
-  payments        Payment[]
+  // Aircond system type — determines onboarding flow
+  aircondSystemType AircondSystemType? // SPLIT or CENTRAL
+
+  // If SPLIT: number of units + HP captured via Appliance table
+  // If CENTRAL: size captured here (RT range)
+  centralAircondSize CentralAircondSize? // SMALL/MEDIUM/LARGE/VERY_LARGE
+
+  // Building age — drives age penalty in bleeder engine
+  // 1=New(<5yr) 2=Medium(5-15yr) 3=Old(>15yr)
+  buildingAge     Int?
+
+  // Dewan/main hall floor area — for lighting calculation
+  // 1=Small(<200sqft) 2=Medium(200-500) 3=Large(500-1000) 4=VeryLarge(>1000)
+  floorAreaCategory Int?
+
+  // Light type in main hall
+  // 1=LED 2=Fluorescent 3=Mixed
+  lightType       Int?
+
+  // ── CHAIN TRACKING ───────────────────────────────────────
+  chainStatus      ChainStatus   @default(ONBOARD)
+  lastBillingMonth String?
+  chainBrokenAt    DateTime?
+
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  appliances       Appliance[]
+  billingRecords   BillingRecord[]
+  payments         Payment[]
 
   @@map("users")
 }
@@ -92,14 +134,26 @@ model Appliance {
   userId          String
   user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   roomName        String
+
   applianceType   ApplianceType
+
+  // ── SPLIT AIRCOND ─────────────────────────────────────
   brand           String?
-  hp              Float?
-  wattage         Float?        // User declared wattage — overrides lookup table
+  hp              Float?        // For split aircond
   inverter        Boolean       @default(false)
+
+  // ── CENTRAL AIRCOND ───────────────────────────────────
+  // Stored as wattage (converted from RT during onboarding)
+  // 1 RT = 3.517 kW, COP 4.0 → input power = RT × 0.879 kW
+  // Example: 35 RT → 35 × 0.879 = 30.77 kW = 30,770W
+  wattage         Float?        // Actual wattage — overrides HP lookup
+                                // For central: computed from RT
+                                // For household: user declared
+
   ageYears        Float         @default(0)
   qty             Int           @default(1)
-  avgHoursDaily   Float
+  avgHoursDaily   Float         // For institutional: set from prayer schedule
+
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
@@ -111,83 +165,67 @@ model BillingRecord {
   userId            String
   user              User          @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  // ── BILLING PERIOD ──────────────────────────────────────
+  // ── BILLING PERIOD ───────────────────────────────────────
   billingMonth      String        // YYYY-MM — from Tempoh Bil END date
   billingPeriodDays Int           @default(30)
   billingPeriodStart String?      // YYYY-MM-DD
   billingPeriodEnd   String?      // YYYY-MM-DD
 
-  // ── USAGE ───────────────────────────────────────────────
+  // ── USAGE ────────────────────────────────────────────────
   totalKwh          Float
   totalAmountMyr    Float         // Jumlah Perlu Dibayar (grand total inc arrears)
   cajSemasa         Float         @default(0) // Current month only (no arrears)
   tunggakan         Float         @default(0) // Arrears from previous months
 
-  // ── BILL COMPONENTS (from OCR) ──────────────────────────
+  // ── BILL COMPONENTS (from OCR) ───────────────────────────
   generationCharge  Float         @default(0)
   capacityCharge    Float         @default(0)
   networkCharge     Float         @default(0)
   retailCharge      Float         @default(0)
-  afaCharge         Float         @default(0) // Net AFA (sum of all components)
-  eeRebate          Float         @default(0) // EEI rebate (positive number)
+  afaCharge         Float         @default(0)
+  eeRebate          Float         @default(0)
   sstCharge         Float         @default(0)
   kwtbbCharge       Float         @default(0)
   latePaymentCharge Float         @default(0)
 
-  // ── RAW OCR ─────────────────────────────────────────────
-  rawOcrText        String?       // Full OCR JSON including afaComponents
+  // ── RAW OCR ──────────────────────────────────────────────
+  rawOcrText        String?
 
-  // ── 2-BILL 1-REPORT LOGIC ───────────────────────────────
-  // isReference = true: first bill of onboard pair
-  //   → hidden from history
-  //   → no report generated
-  //   → no payment required
-  //   → used as comparison baseline only
-  // isReference = false: the report bill
-  //   → shown in history
-  //   → report generated
-  //   → payment required to unlock
+  // ── 2-BILL 1-REPORT LOGIC ────────────────────────────────
   isReference       Boolean       @default(false)
-
-  // Which month was used as reference for this report
-  // For June report → referenceMonth = "2026-05"
-  // Null if isReference = true (this IS the reference)
   referenceMonth    String?
 
   // ── PAYMENT + UNLOCK ─────────────────────────────────────
   isUnlocked        Boolean       @default(false)
-  teaserAmount      Float?        // Estimated potential saving shown in teaser
+  teaserAmount      Float?
   paymentId         String?
   payment           Payment?      @relation(fields: [paymentId], references: [id])
 
   // ── HEALTH SCORE ─────────────────────────────────────────
-  // Calculated fresh every time report is viewed
-  // Stored for trend tracking and history display
-  // Score 0-100
-  healthScore       Int?
-  healthBand        HealthBand?   // EXCELLENT/GOOD/FAIR/ATTENTION/CRITICAL
+  healthScore            Int?
+  healthBand             HealthBand?
+  healthScoreThreshold   Int?
+  healthScoreTrend       Int?
+  healthScoreBleeder     Int?
+  healthScoreAfa         Int?
+  healthScoreCause       Int?
 
-  // Health score breakdown (stored for display)
-  // Each factor stored separately for transparency
-  healthScoreThreshold   Int?     // Factor 1: 0-25 pts (below 600 kWh?)
-  healthScoreTrend       Int?     // Factor 2: 0-25 pts (month vs month)
-  healthScoreBleeder     Int?     // Factor 3: 0-25 pts (bleeder concentration)
-  healthScoreAfa         Int?     // Factor 4: 0-15 pts (AFA exposure)
-  healthScoreCause       Int?     // Factor 5: 0-10 pts (bill change cause)
+  // ── INSTITUTIONAL — EXPECTED VS ACTUAL ───────────────────
+  // Expected kWh = calculated from prayer schedule + appliance profile
+  // Actual kWh = from TNB bill (totalKwh)
+  // Gap = waste = the bleeder for institutions
+  expectedKwhMonthly  Float?  // What they SHOULD use (prayer hours only)
+  wastedKwhMonthly    Float?  // totalKwh - expectedKwhMonthly = waste
+  wastedAmountMyr     Float?  // wastedKwhMonthly × effectiveRate = RM wasted
 
-  // ── REPORT DATA ──────────────────────────────────────────
-  reportData        Json?         // Stored report (not used for display — recalculated fresh)
+  // ── REPORT DATA ───────────────────────────────────────────
+  reportData        Json?
 
-  // ── MISSION TRACKING ────────────────────────────────────
-  // Store missions from THIS report
-  // Next month's report checks if missions were completed
-  missionsData      Json?         // Array of missions given this month
-
-  // Mission completion (calculated when NEXT bill uploaded)
-  // Did user achieve the target from last month's missions?
-  missionKwhTarget  Float?        // Target kWh for next month
-  missionKwhActual  Float?        // Actual kWh achieved (filled when next bill uploaded)
-  missionCompleted  Boolean?      // Did user beat target?
+  // ── MISSION TRACKING ─────────────────────────────────────
+  missionsData      Json?
+  missionKwhTarget  Float?
+  missionKwhActual  Float?
+  missionCompleted  Boolean?
 
   createdAt         DateTime      @default(now())
   updatedAt         DateTime      @updatedAt
@@ -216,9 +254,9 @@ model Payment {
 
 model AfaRate {
   id          String    @id @default(cuid())
-  month       String    @unique  // YYYY-MM
-  rateSen     Float              // Declared rate in sen/kWh
-  note        String?            // Energy Commission announcement note
+  month       String    @unique
+  rateSen     Float
+  note        String?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 

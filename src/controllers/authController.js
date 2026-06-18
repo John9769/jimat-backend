@@ -12,7 +12,7 @@ const generateToken = (id) => {
 // Register
 const register = async (req, res) => {
   try {
-    const { email, password, name, phone, userType, orgName, postcode, township, state, housingType, language } = req.body;
+    const { email, password, name, phone, userType, orgName, postcode, township, state, housingType, language, institutionType, aircondSystemType, centralAircondSize, buildingAge, floorAreaCategory, lightType } = req.body;
 
     if (!email || !password || !name) {
       return res.status(400).json({ success: false, message: 'Email, password and name are required' });
@@ -37,7 +37,13 @@ const register = async (req, res) => {
         township: township || null,
         state: state || null,
         housingType: housingType || null,
-        language: language || 'EN'
+        language: language || 'EN',
+        institutionType: institutionType || null,
+        aircondSystemType: aircondSystemType || null,
+        centralAircondSize: centralAircondSize || null,
+        buildingAge: buildingAge ? parseInt(buildingAge) : null,
+        floorAreaCategory: floorAreaCategory ? parseInt(floorAreaCategory) : null,
+        lightType: lightType ? parseInt(lightType) : null
       }
     });
 
@@ -128,7 +134,7 @@ const getProfile = async (req, res) => {
 // Update profile
 const updateProfile = async (req, res) => {
   try {
-    const { name, phone, postcode, township, state, housingType, language } = req.body;
+    const { name, phone, postcode, township, state, housingType, language, institutionType, aircondSystemType, centralAircondSize, buildingAge, floorAreaCategory, lightType } = req.body;
 
     const user = await prisma.user.update({
       where: { id: req.user.id },
@@ -139,7 +145,13 @@ const updateProfile = async (req, res) => {
         township: township || undefined,
         state: state || undefined,
         housingType: housingType || undefined,
-        language: language || undefined
+        language: language || undefined,
+        institutionType: institutionType || undefined,
+        aircondSystemType: aircondSystemType || undefined,
+        centralAircondSize: centralAircondSize || undefined,
+        buildingAge: buildingAge ? parseInt(buildingAge) : undefined,
+        floorAreaCategory: floorAreaCategory ? parseInt(floorAreaCategory) : undefined,
+        lightType: lightType ? parseInt(lightType) : undefined
       }
     });
 

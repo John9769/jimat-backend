@@ -1,6 +1,6 @@
 const { PrismaClient } = require('@prisma/client');
 const { calculateTNBBill } = require('../engine/tnbEngine');
-const { analyseBleeders, generateMissions } = require('../engine/bleederEngine');
+const { analyseBleeders, generateMissions, generateInstitutionalProfile, calculateInstitutionalWaste } = require('../engine/bleederEngine');
 const { calculateHealthScore, calculateMissionTarget } = require('../engine/healthEngine');
 
 const prisma = new PrismaClient();
@@ -112,12 +112,19 @@ const getReport = async (req, res) => {
     );
 
     // ── BLEEDER ENGINE ────────────────────────────────────
-    // Uses actual effective rate from bill
+    // For INSTITUTIONAL — generate profile if no appliances declared
+    let appliancesToUse = appliances;
+    if (req.user.userType === 'INSTITUTIONAL' && appliances.length === 0) {
+      appliancesToUse = generateInstitutionalProfile(req.user);
+    }
+
     let bleederResult = null;
     let missions = [];
-    if (appliances.length > 0) {
+    let institutionalWaste = null;
+
+    if (appliancesToUse.length > 0) {
       bleederResult = analyseBleeders(
-        appliances,
+        appliancesToUse,
         record.totalKwh,
         actualEffectiveRateSen,
         record.billingPeriodDays || 30
@@ -126,6 +133,16 @@ const getReport = async (req, res) => {
         ...billAnalysis,
         effectiveRateSen: actualEffectiveRateSen
       }, req.user.language);
+    }
+
+    // Institutional — expected vs actual kWh waste
+    if (req.user.userType === 'INSTITUTIONAL' && appliancesToUse.length > 0) {
+      institutionalWaste = calculateInstitutionalWaste(
+        appliancesToUse,
+        record.totalKwh,
+        actualEffectiveRateSen,
+        record.billingPeriodDays || 30
+      );
     }
 
     // ── GET REFERENCE RECORD ──────────────────────────────
@@ -369,7 +386,9 @@ const getReport = async (req, res) => {
         allBleeders: bleederResult.bleeders,
         totalPotentialSavingMyr: bleederResult.totalPotentialSavingMyr,
         coveragePercent: bleederResult.coveragePercent,
-        effectiveRateSenUsed: actualEffectiveRateSen
+        effectiveRateSenUsed: actualEffectiveRateSen,
+        // Institutional only
+        institutionalWaste: institutionalWaste || null
       } : null,
 
       // ── SCREEN 3 — MISSIONS ───────────────────────────

@@ -68,6 +68,35 @@ const APPLIANCE_WATTAGE = {
   OTHER:           { wattage: 100  }  // Unknown — conservative 100W
 };
 
+// ── CENTRAL AIRCOND (INSTITUTIONAL) ───────────────────────
+// 1 RT = 3.517 kW, COP 4.0 → input power = RT × 0.879 kW
+// Source: ASHRAE, Malaysian central chiller industry standard
+const CENTRAL_AIRCOND_RT = {
+  SMALL:      { midpointRT: 15  }, // 10-20 RT — surau kecil
+  MEDIUM:     { midpointRT: 35  }, // 20-50 RT — masjid biasa
+  LARGE:      { midpointRT: 75  }, // 50-100 RT — masjid negeri
+  VERY_LARGE: { midpointRT: 150 }  // >100 RT — kompleks masjid
+};
+
+const getCentralAircondWattage = (sizeCategory) => {
+  const rt = CENTRAL_AIRCOND_RT[sizeCategory]?.midpointRT || 35;
+  // Input power = RT × 3.517 kW ÷ COP(4.0) = RT × 0.879 kW
+  return Math.round(rt * 0.879 * 1000); // returns Watts
+};
+
+// ── MASJID PRAYER TIME HOURS (HARDCODED MALAYSIAN STANDARD) ──
+// Aircond ON for all 5 prayers: Subuh(2) + Zohor(1.5) + Asar(1) + Maghrib(1) + Isyak(1) = 6.5hrs
+// Lights ON for 3 dark prayers: Subuh(2) + Maghrib(1) + Isyak(1.5) = 4.5hrs
+// Water heater for wudhu all 5 prayers: avg 30min × 5 = 2.5hrs
+// Jumaat extra: 2hrs × 4 Fridays = 8hrs/month extra aircond
+// Monthly aircond hours = (6.5 × 30) + 8 = 203hrs/month
+// Daily equivalent = 203 ÷ 30 = 6.77hrs/day
+const PRAYER_HOURS = {
+  AIRCOND:      6.77, // daily avg including Jumaat
+  LIGHTS:       4.5,  // dark prayers only
+  WATER_HEATER: 2.5   // wudhu for all 5 prayers
+};
+
 // ── AGE EFFICIENCY PENALTY ─────────────────────────────────
 // Source: General HVAC industry standard
 // Well-maintained unit: 1-2% degradation per year
@@ -86,8 +115,11 @@ const analyseBleeders = (appliances, totalKwh, effectiveRateSen, billingPeriodDa
     let wattage = 0;
 
     if (appliance.applianceType === 'AIRCOND') {
-      // Use HP + inverter flag for aircond
       wattage = getAircondWattage(appliance.hp || 1.5, appliance.inverter || false);
+    } else if (appliance.applianceType === 'CENTRAL_AIRCOND') {
+      // Central chiller — wattage already computed from RT during onboarding
+      // Stored in appliance.wattage directly
+      wattage = appliance.wattage || getCentralAircondWattage('MEDIUM');
     } else if (appliance.wattage && appliance.wattage > 0) {
       // User declared actual wattage — use directly
       wattage = parseFloat(appliance.wattage);
@@ -112,7 +144,22 @@ const analyseBleeders = (appliances, totalKwh, effectiveRateSen, billingPeriodDa
     let longtermSavingMyr = 0;
     let longtermTip = '';
 
-    if (appliance.applianceType === 'AIRCOND') {
+    if (appliance.applianceType === 'CENTRAL_AIRCOND') {
+      // Central chiller institutional missions
+      // Main saving = switch off between prayers
+      const wastedHours = appliance.avgHoursDaily - PRAYER_HOURS.AIRCOND;
+      if (wastedHours > 0) {
+        const wastedKwh = (adjustedWattage * wastedHours * billingPeriodDays) / 1000;
+        immediateSavingMyr = Math.max(wastedKwh * (effectiveRateSen / 100), 0);
+        immediateTip = `Switch off central aircond between prayers. Running ${appliance.avgHoursDaily.toFixed(1)}hrs/day but only ${PRAYER_HOURS.AIRCOND}hrs needed — save est. RM${immediateSavingMyr.toFixed(0)}/month immediately`;
+      } else {
+        immediateSavingMyr = monthlyCostMyr * 0.10;
+        immediateTip = `Set thermostat to 24°C — each 1°C lower increases consumption 10%. Save est. RM${immediateSavingMyr.toFixed(0)}/month`;
+      }
+      longtermSavingMyr = monthlyCostMyr * 0.15;
+      longtermTip = `Install BMS (Building Management System) timer — auto-on 30 mins before prayer, auto-off 15 mins after. ROI typically 12-18 months.`;
+
+    } else if (appliance.applianceType === 'AIRCOND') {
       if (!appliance.inverter) {
         // Non-inverter aircond
         // Immediate — reduce by 2hrs/day
@@ -315,4 +362,121 @@ const generateMissions = (bleederResult, billAnalysis, language = 'EN') => {
   return missions.slice(0, 3);
 };
 
-module.exports = { analyseBleeders, generateMissions };
+// ── GENERATE INSTITUTIONAL APPLIANCE PROFILE ───────────────
+// Converts 5-question onboarding answers into appliance array
+// Called from billController when user is INSTITUTIONAL
+const generateInstitutionalProfile = (user) => {
+  const appliances = [];
+
+  // Building age in years (midpoint of category)
+  const buildingAgeMap = { 1: 2, 2: 10, 3: 18 };
+  const ageYears = buildingAgeMap[user.buildingAge] || 10;
+
+  // ── AIRCOND ─────────────────────────────────────────────
+  if (user.aircondSystemType === 'SPLIT') {
+    // Split units — from Appliance table (user entered qty + HP)
+    // Already in DB — no need to generate
+  } else if (user.aircondSystemType === 'CENTRAL') {
+    // Central chiller — generate from centralAircondSize
+    const wattage = getCentralAircondWattage(user.centralAircondSize || 'MEDIUM');
+    appliances.push({
+      roomName: 'Dewan Solat',
+      applianceType: 'CENTRAL_AIRCOND',
+      wattage,
+      ageYears,
+      qty: 1,
+      avgHoursDaily: PRAYER_HOURS.AIRCOND,
+      inverter: false,
+      hp: null,
+      brand: null
+    });
+  }
+
+  // ── LIGHTS ───────────────────────────────────────────────
+  const floorAreaM2Map = { 1: 18.6, 2: 32.5, 3: 69.7, 4: 139.4 };
+  const lightWperM2Map = { 1: 10, 2: 20, 3: 15 }; // LED/Fluorescent/Mixed
+  const floorM2 = floorAreaM2Map[user.floorAreaCategory] || 32.5;
+  const wPerM2 = lightWperM2Map[user.lightType] || 15;
+  const lightingWattage = Math.round(floorM2 * wPerM2);
+
+  appliances.push({
+    roomName: 'Dewan Solat',
+    applianceType: 'LIGHTS',
+    wattage: lightingWattage,
+    ageYears: ageYears,
+    qty: 1,
+    avgHoursDaily: PRAYER_HOURS.LIGHTS,
+    inverter: false,
+    hp: null,
+    brand: null
+  });
+
+  // ── WATER HEATER ─────────────────────────────────────────
+  // Most masjid have at least 1 water heater for wudhu
+  appliances.push({
+    roomName: 'Kawasan Wudhu',
+    applianceType: 'WATER_HEATER',
+    wattage: 3500,
+    ageYears,
+    qty: 1,
+    avgHoursDaily: PRAYER_HOURS.WATER_HEATER,
+    inverter: false,
+    hp: null,
+    brand: null
+  });
+
+  // ── WATER PUMP ───────────────────────────────────────────
+  appliances.push({
+    roomName: 'Sistem Air',
+    applianceType: 'WATER_PUMP',
+    wattage: 375,
+    ageYears,
+    qty: 1,
+    avgHoursDaily: 3,
+    inverter: false,
+    hp: null,
+    brand: null
+  });
+
+  return appliances;
+};
+
+// ── CALCULATE EXPECTED VS ACTUAL KWH (INSTITUTIONAL) ────────
+// Expected = what they should use based on prayer schedule
+// Actual = from TNB bill
+// Gap = waste = the institutional bleeder
+const calculateInstitutionalWaste = (appliances, actualKwh, effectiveRateSen, billingPeriodDays = 30) => {
+  let expectedKwh = 0;
+
+  appliances.forEach(appliance => {
+    let wattage = 0;
+    if (appliance.applianceType === 'CENTRAL_AIRCOND') {
+      wattage = appliance.wattage || 0;
+    } else if (appliance.applianceType === 'AIRCOND') {
+      wattage = getAircondWattage(appliance.hp || 1.5, appliance.inverter || false);
+    } else {
+      wattage = appliance.wattage || APPLIANCE_WATTAGE[appliance.applianceType]?.wattage || 0;
+    }
+    const agePenalty = getAgePenalty(appliance.ageYears || 0);
+    const adjusted = wattage * agePenalty;
+    expectedKwh += (adjusted * appliance.avgHoursDaily * billingPeriodDays * (appliance.qty || 1)) / 1000;
+  });
+
+  const wastedKwh = Math.max(actualKwh - expectedKwh, 0);
+  const wastedAmountMyr = Math.round(wastedKwh * (effectiveRateSen / 100) * 100) / 100;
+
+  return {
+    expectedKwhMonthly: Math.round(expectedKwh * 10) / 10,
+    wastedKwhMonthly: Math.round(wastedKwh * 10) / 10,
+    wastedAmountMyr,
+    wastePercent: actualKwh > 0 ? Math.round((wastedKwh / actualKwh) * 100) : 0
+  };
+};
+
+module.exports = {
+  analyseBleeders,
+  generateMissions,
+  generateInstitutionalProfile,
+  calculateInstitutionalWaste,
+  PRAYER_HOURS
+};
