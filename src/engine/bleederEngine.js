@@ -394,9 +394,67 @@ const analyseBleeders = (appliances, totalKwh, effectiveRateSen, billingPeriodDa
 };
 
 // ── GENERATE MISSIONS ─────────────────────────────────────
-// Mission 1 = coverage gap if < 80%, else top bleeder immediate
-// Mission 2 = tier threshold if near/above 600 kWh
-// Mission 3 = long term top bleeder action
+// Every declared appliance gets a mission
+// Total of all missions = totalPotentialSavingMyr exactly
+// Tier drop added as bonus mission if above 600 kWh
+const generateMissions = (bleederResult, billAnalysis, language = 'EN') => {
+  if (!bleederResult) return { missions: [], totalSaving: 0, coverageNote: null };
+
+  const { bleeders, coveragePercent, coverageGapKwh } = bleederResult;
+  const { flags } = billAnalysis;
+
+  const missions = [];
+
+  // Every appliance = one mission with exact saving
+  bleeders.forEach((bleeder, i) => {
+    if (bleeder.immediateSavingMyr > 0) {
+      missions.push({
+        priority: i + 1,
+        icon: i === 0 ? '⚡' : '💡',
+        title: i === 0
+          ? (language === 'BM' ? 'Buat Malam Ini — Percuma' : 'Do This Tonight — Free')
+          : (language === 'BM' ? `Kurangkan Kos: ${bleeder.roomName}` : `Cut Cost: ${bleeder.roomName}`),
+        description: bleeder.immediateTip,
+        estimatedSavingMyr: bleeder.immediateSavingMyr,
+        appliance: `${bleeder.roomName} — ${bleeder.applianceType}`,
+        isCoverageAlert: false
+      });
+    }
+  });
+
+  // Tier drop — bonus mission if above 600 kWh
+  if (flags && flags.aboveThreshold) {
+    const tierDropSaving = calculateTierDropSaving(
+      billAnalysis.kwh || 0,
+      billAnalysis.effectiveRateSen || 39
+    );
+    if (tierDropSaving > 0) {
+      missions.push({
+        priority: missions.length + 1,
+        icon: '🎯',
+        title: language === 'BM' ? 'Sasaran: Bawah 600 kWh' : 'Target: Below 600 kWh',
+        description: language === 'BM'
+          ? `Anda ${Math.round((billAnalysis.kwh || 0) - 600)} kWh melebihi had 600 kWh. Turun bawah 600 kWh — Caj Runcit RM10 + SST dikecualikan automatik. Jimat est. RM${tierDropSaving}/bulan.`
+          : `You are ${Math.round((billAnalysis.kwh || 0) - 600)} kWh above 600 threshold. Drop below 600 kWh — RM10 Retail Charge + SST waived automatically. Save est. RM${tierDropSaving}/month.`,
+        estimatedSavingMyr: tierDropSaving,
+        appliance: null,
+        isCoverageAlert: false
+      });
+    }
+  }
+
+  // Total = exact sum of ALL missions shown
+  const totalSaving = round2(missions.reduce((sum, m) => sum + (m.estimatedSavingMyr || 0), 0));
+
+  // Coverage gap — note only
+  const coverageNote = coveragePercent < 80 && coverageGapKwh > 0
+    ? (language === 'BM'
+      ? `Peralatan yang anda isytiharkan menyumbang ${coveragePercent}% penggunaan sebenar. Tambah peralatan yang tiada bulan depan untuk analisis lebih tepat.`
+      : `Your declared appliances account for ${coveragePercent}% of actual usage. Add missing appliances next month for a more accurate analysis.`)
+    : null;
+
+  return { missions, totalSaving, coverageNote };
+};
 const generateMissions = (bleederResult, billAnalysis, language = 'EN') => {
   if (!bleederResult) return { missions: [], totalSaving: 0, coverageNote: null };
 
