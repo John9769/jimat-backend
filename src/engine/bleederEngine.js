@@ -455,75 +455,7 @@ const generateMissions = (bleederResult, billAnalysis, language = 'EN') => {
 
   return { missions, totalSaving, coverageNote };
 };
-const generateMissions = (bleederResult, billAnalysis, language = 'EN') => {
-  if (!bleederResult) return { missions: [], totalSaving: 0, coverageNote: null };
 
-  const missions = [];
-  const { bleeders, topBleeder, coveragePercent, coverageGapKwh, totalPotentialSavingMyr } = bleederResult;
-  const { flags } = billAnalysis;
-
-  // Mission 1 — Top bleeder IMMEDIATE action always
-  // Coverage gap moved to note only — not a mission
-  if (topBleeder && topBleeder.immediateSavingMyr > 0) {
-    missions.push({
-      priority: 1,
-      icon: '⚡',
-      title: language === 'BM' ? 'Buat Malam Ini — Percuma' : 'Do This Tonight — Free',
-      description: topBleeder.immediateTip,
-      estimatedSavingMyr: topBleeder.immediateSavingMyr,
-      appliance: `${topBleeder.roomName} — ${topBleeder.applianceType}`,
-      isCoverageAlert: false
-    });
-  }
-
-  // Mission 2 — Tier drop if above 600 kWh
-  if (flags && flags.aboveThreshold) {
-    const tierDropSaving = calculateTierDropSaving(
-      billAnalysis.kwh || 0,
-      billAnalysis.effectiveRateSen || 39
-    );
-    if (tierDropSaving > 0) {
-      missions.push({
-        priority: 2,
-        icon: '🎯',
-        title: language === 'BM' ? 'Sasaran: Bawah 600 kWh' : 'Target: Below 600 kWh',
-        description: language === 'BM'
-          ? `Anda ${Math.round((billAnalysis.kwh || 0) - 600)} kWh melebihi had 600 kWh. Turun bawah 600 kWh — Caj Runcit RM10 + SST dikecualikan automatik. Jimat est. RM${tierDropSaving}/bulan.`
-          : `You are ${Math.round((billAnalysis.kwh || 0) - 600)} kWh above 600 threshold. Drop below 600 kWh — RM10 Retail Charge + SST waived automatically. Save est. RM${tierDropSaving}/month.`,
-        estimatedSavingMyr: tierDropSaving,
-        appliance: null,
-        isCoverageAlert: false
-      });
-    }
-  }
-
-  // Mission 3 — Second bleeder immediate action
-  if (bleeders.length > 1 && bleeders[1].immediateSavingMyr > 0) {
-    const second = bleeders[1];
-    missions.push({
-      priority: 3,
-      icon: '💡',
-      title: language === 'BM' ? 'Kurangkan Pembazir #2' : 'Cut Your #2 Cost',
-      description: second.immediateTip,
-      estimatedSavingMyr: second.immediateSavingMyr,
-      appliance: `${second.roomName} — ${second.applianceType}`,
-      isCoverageAlert: false
-    });
-  }
-
-  // Coverage gap — note only, not a mission
-  const coverageNote = coveragePercent < 80 && coverageGapKwh > 0
-    ? (language === 'BM'
-      ? `Peralatan yang anda isytiharkan menyumbang ${coveragePercent}% penggunaan sebenar. Tambah peralatan yang tiada bulan depan untuk analisis lebih tepat.`
-      : `Your declared appliances account for ${coveragePercent}% of actual usage. Add missing appliances next month for a more accurate analysis.`)
-    : null;
-
-  return {
-    missions: missions.slice(0, 3),
-    totalSaving: round2(totalPotentialSavingMyr || 0),
-    coverageNote
-  };
-};
 
 // ── INSTITUTIONAL PROFILE GENERATOR ──────────────────────
 const generateInstitutionalProfile = (user) => {
