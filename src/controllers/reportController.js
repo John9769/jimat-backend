@@ -170,7 +170,7 @@ const getReport = async (req, res) => {
         : 0;
 
       const currentAfaCharge = ocrData.afaCharge || record.afaCharge || 0;
-      const afaChange = round2(currentAfaCharge - referenceAfaCharge);
+      const afaChange = round2(currentAfaCharge);
       const behaviourChange = round2(amountDiff - afaChange);
 
       comparison = {
