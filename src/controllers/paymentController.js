@@ -42,7 +42,14 @@ const createPayment = async (req, res) => {
     }
 
     const chainStatus = await getChainStatus(req.user.id, prisma);
-    const pricing = getPricing(req.user.userType, chainStatus.status);
+
+    // Check if user has any previous successful payments
+    // If none — this is their first payment — charge ONBOARD price
+    const previousPayments = await prisma.payment.count({
+      where: { userId: req.user.id, status: 'SUCCESS' }
+    });
+    const effectiveChainStatus = previousPayments === 0 ? 'ONBOARD' : chainStatus.status;
+    const pricing = getPricing(req.user.userType, effectiveChainStatus);
 
     const categoryCode = req.user.userType === 'INSTITUTIONAL'
       ? process.env.TOYYIBPAY_CATEGORY_INSTITUTIONAL
