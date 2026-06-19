@@ -477,6 +477,14 @@ const getTeaser = async (req, res) => {
       });
     }
 
+    // Determine correct price based on payment history
+    const previousPayments = await prisma.payment.count({
+      where: { userId: req.user.id, status: 'SUCCESS' }
+    });
+    const effectiveStatus = previousPayments === 0 ? 'ONBOARD' : 'MONTHLY';
+    const { getPricing } = require('../engine/chainEngine');
+    const pricing = getPricing(req.user.userType, effectiveStatus);
+
     res.json({
       success: true,
       isUnlocked: false,
@@ -493,7 +501,9 @@ const getTeaser = async (req, res) => {
         coveragePercent: record.coveragePercent,
         healthScore: record.healthScore,
         healthBand: record.healthBand,
-        missionKwhTarget: record.missionKwhTarget
+        missionKwhTarget: record.missionKwhTarget,
+        price: pricing.price,
+        total: pricing.total
       }
     });
   } catch (error) {
