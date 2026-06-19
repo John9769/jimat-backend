@@ -14,7 +14,28 @@ app.use(cors({
 // ── CRITICAL: Webhook route needs raw urlencoded parser BEFORE json parser ──
 // ToyyibPay sends webhook as application/x-www-form-urlencoded
 // Must be registered BEFORE express.json() to avoid conflicts
-app.use('/api/payment/webhook', express.urlencoded({ extended: true, limit: '10mb' }));
+app.use('/api/payment/webhook', (req, res, next) => {
+  const contentType = req.headers['content-type'] || '';
+  if (contentType.includes('multipart/form-data')) {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => {
+      // Parse multipart form data manually — extract key=value pairs
+      const boundary = contentType.split('boundary=')[1];
+      if (boundary) {
+        const parts = body.split('--' + boundary);
+        req.body = {};
+        parts.forEach(part => {
+          const match = part.match(/Content-Disposition: form-data; name="([^"]+)"\r\n\r\n([^\r\n]*)/);
+          if (match) req.body[match[1]] = match[2];
+        });
+      }
+      next();
+    });
+  } else {
+    express.urlencoded({ extended: true, limit: '10mb' })(req, res, next);
+  }
+});
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
