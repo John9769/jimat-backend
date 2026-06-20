@@ -139,7 +139,15 @@ EXTRACTION RULES:
     });
 
     const rawText = response.content[0].text.trim();
-    const clean = rawText.replace(/```json|```/g, '').trim();
+    let clean = rawText.replace(/```json|```/g, '').trim();
+
+    // Strip any conversational preamble/postamble — extract only the JSON object
+    const firstBrace = clean.indexOf('{');
+    const lastBrace = clean.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      clean = clean.substring(firstBrace, lastBrace + 1);
+    }
+
     const parsed = JSON.parse(clean);
 
     // ── POST PROCESSING ───────────────────────────────────
