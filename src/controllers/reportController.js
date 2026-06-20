@@ -1,7 +1,8 @@
 const { PrismaClient } = require('@prisma/client');
 const { calculateTNBBill } = require('../engine/tnbEngine');
-const { analyseBleeders, generateMissions, generateInstitutionalProfile, calculateInstitutionalWaste } = require('../engine/bleederEngine');
+const { analyseBleeders, generateMissions, generateBehaviourMission, generateInstitutionalProfile, calculateInstitutionalWaste, calculateTierDropSaving } = require('../engine/bleederEngine');
 const { calculateHealthScore, calculateMissionTarget } = require('../engine/healthEngine');
+const { getChainStatus } = require('../engine/chainEngine');
 
 const prisma = new PrismaClient();
 
@@ -202,6 +203,54 @@ const getReport = async (req, res) => {
           highTier: referenceRecord.totalKwh <= 1500 && record.totalKwh > 1500
         }
       };
+    }
+
+    // ── LAYER 2 — BEHAVIOUR MISSIONS (MONTHLY/loyal users only) ──
+    if (referenceRecord && comparison) {
+      const chainStatus = await getChainStatus(req.user.id, prisma);
+
+      if (chainStatus.status === 'MONTHLY' && appliancesToUse.length > 0) {
+        const referenceOcr = getOcrData(referenceRecord);
+        const referenceCajSemasaForBleeder = getCajSemasa(referenceRecord);
+        const referenceEffectiveRateSen = referenceRecord.totalKwh > 0
+          ? round2((referenceCajSemasaForBleeder / referenceRecord.totalKwh) * 100)
+          : actualEffectiveRateSen;
+
+        // Re-run bleeder analysis against REFERENCE bill's kWh/rate, same current appliances
+        const referenceBleederResult = analyseBleeders(
+          appliancesToUse,
+          referenceRecord.totalKwh,
+          referenceEffectiveRateSen,
+          referenceRecord.billingPeriodDays || 30
+        );
+
+        const referenceExcessKwh = Math.max(referenceRecord.totalKwh - 600, 0);
+        const referenceFlags = {
+          aboveThreshold: referenceExcessKwh > 0
+        };
+
+        const currentExcessKwh = Math.max(record.totalKwh - 600, 0);
+        const currentFlagsForBehaviour = { aboveThreshold: currentExcessKwh > 0 };
+
+        const behaviourMissions = generateBehaviourMission({
+          currentKwh: record.totalKwh,
+          referenceKwh: referenceRecord.totalKwh,
+          currentFlags: currentFlagsForBehaviour,
+          referenceFlags,
+          currentTopBleederType: bleederResult?.topBleeder?.applianceType || null,
+          referenceTopBleederType: referenceBleederResult?.topBleeder?.applianceType || null,
+          excessKwh: currentExcessKwh,
+          effectiveRateSen: actualEffectiveRateSen
+        }, req.user.language || 'EN');
+
+        if (behaviourMissions.length > 0 && missions.missions) {
+          missions.missions = [...behaviourMissions, ...missions.missions];
+          missions.missions.forEach((m, i) => { m.priority = i + 1; });
+          missions.totalSaving = round2(
+            missions.missions.reduce((sum, m) => sum + (m.estimatedSavingMyr || 0), 0)
+          );
+        }
+      }
     }
 
     // ── MISSION COMPLETION ────────────────────────────────
