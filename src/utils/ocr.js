@@ -6,6 +6,8 @@ const extractTNBBill = async (fileBuffer, mimeType = 'image/jpeg') => {
   try {
     const base64Data = fileBuffer.toString('base64');
 
+    const isPdf = mimeType === 'application/pdf';
+
     const response = await client.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 2000,
@@ -14,7 +16,7 @@ const extractTNBBill = async (fileBuffer, mimeType = 'image/jpeg') => {
           role: 'user',
           content: [
             {
-              type: 'image',
+              type: isPdf ? 'document' : 'image',
               source: {
                 type: 'base64',
                 media_type: mimeType,
