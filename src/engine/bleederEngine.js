@@ -446,14 +446,125 @@ const generateMissions = (bleederResult, billAnalysis, language = 'EN') => {
   // Total = exact sum of ALL missions shown
   const totalSaving = round2(missions.reduce((sum, m) => sum + (m.estimatedSavingMyr || 0), 0));
 
-  // Coverage gap — note only
-  const coverageNote = coveragePercent < 80 && coverageGapKwh > 0
-    ? (language === 'BM'
-      ? `Peralatan yang anda isytiharkan menyumbang ${coveragePercent}% penggunaan sebenar. Tambah peralatan yang tiada bulan depan untuk analisis lebih tepat.`
-      : `Your declared appliances account for ${coveragePercent}% of actual usage. Add missing appliances next month for a more accurate analysis.`)
-    : null;
+  // Ghost Gap — promoted to full mission (always first, applies to all users)
+  if (coveragePercent < 80 && coverageGapKwh > 0) {
+    const gapEffectiveRateSen = billAnalysis.effectiveRateSen || 39;
+    const gapEstimatedCostMyr = round2(coverageGapKwh * (gapEffectiveRateSen / 100));
+    missions.unshift({
+      priority: 0,
+      icon: '🔍',
+      title: language === 'BM' ? 'Peralatan Hantu Dikesan' : 'Ghost Appliances Detected',
+      description: language === 'BM'
+        ? `Peralatan yang anda isytiharkan hanya menyumbang ${coveragePercent}% daripada penggunaan sebenar anda. ${coverageGapKwh} kWh — anggaran RM${gapEstimatedCostMyr} daripada bil anda — datang daripada peralatan yang kami tidak tahu. Kemaskini peralatan anda untuk laporan yang lebih tepat.`
+        : `Your declared appliances only explain ${coveragePercent}% of your actual usage. ${coverageGapKwh} kWh — roughly RM${gapEstimatedCostMyr} of your bill — comes from appliances we don't know about. Update your appliances for a sharper report.`,
+      estimatedSavingMyr: 0,
+      appliance: null,
+      isCoverageAlert: true,
+      actionButton: language === 'BM' ? 'Kemaskini Peralatan' : 'Update My Appliances'
+    });
+  }
 
-  return { missions, totalSaving, coverageNote };
+  // Re-number priorities after unshift
+  missions.forEach((m, i) => { m.priority = i + 1; });
+
+  return { missions, totalSaving, coverageNote: null };
+};
+
+// ── GENERATE BEHAVIOUR MISSION (Layer 2 — MONTHLY/loyal users only) ──
+// Compares current bill vs reference bill using EXISTING comparison data
+// Re-runs analyseBleeders against reference kWh/rate (same current appliances)
+// to detect bleeder rank shifts. Does NOT touch appliance-based mission figures.
+const generateBehaviourMission = (params, language = 'EN') => {
+  const {
+    currentKwh, referenceKwh, currentFlags, referenceFlags,
+    currentTopBleederType, referenceTopBleederType,
+    excessKwh, effectiveRateSen
+  } = params;
+
+  const behaviourMissions = [];
+  const crossedAbove = !referenceFlags.aboveThreshold && currentFlags.aboveThreshold;
+  const crossedBelow = referenceFlags.aboveThreshold && !currentFlags.aboveThreshold;
+  const stayedAbove = referenceFlags.aboveThreshold && currentFlags.aboveThreshold;
+  const stayedBelow = !referenceFlags.aboveThreshold && !currentFlags.aboveThreshold;
+
+  // ── Tier scenario (highest priority behaviour mission) ──
+  if (crossedAbove) {
+    const tierDropSaving = calculateTierDropSaving(currentKwh, effectiveRateSen);
+    behaviourMissions.push({
+      icon: '📈',
+      title: language === 'BM' ? 'Anda Melepasi 600 kWh' : 'You Crossed 600 kWh',
+      description: language === 'BM'
+        ? `Penggunaan anda melepasi 600 kWh bulan ini — ini mencetuskan Caj Runcit RM10 + AFA + SST yang anda elak bulan lepas. Ini punca utama bil anda naik. Turun bawah 600 kWh untuk buang caj ini serta-merta. Jimat anggaran RM${tierDropSaving}/bulan.`
+        : `Your usage crossed 600 kWh this month — this triggered RM10 Retail Charge + AFA + SST that you avoided last month. This is the biggest reason your bill jumped. Drop below 600 kWh to remove these charges instantly. Save est. RM${tierDropSaving}/month.`,
+      estimatedSavingMyr: tierDropSaving,
+      appliance: null,
+      isBehaviourMission: true
+    });
+  } else if (crossedBelow) {
+    const savingMyr = round2((referenceKwh - currentKwh) * (effectiveRateSen / 100) + 10);
+    behaviourMissions.push({
+      icon: '🎉',
+      title: language === 'BM' ? 'Anda Turun Bawah 600 kWh!' : 'You Dropped Below 600 kWh!',
+      description: language === 'BM'
+        ? `Syabas! Anda turun bawah 600 kWh bulan ini — Caj Runcit dan SST dikecualikan secara automatik. Anda jimat anggaran RM${savingMyr} hanya daripada ini. Kekal bawah 600 kWh untuk terus nikmati faedah ini.`
+        : `Well done! You dropped below 600 kWh this month — Retail Charge and SST waived automatically. You saved an estimated RM${savingMyr} from this alone. Stay below 600 kWh to keep this benefit.`,
+      estimatedSavingMyr: savingMyr,
+      appliance: null,
+      isBehaviourMission: true
+    });
+  } else if (stayedAbove) {
+    const tierDropSaving = calculateTierDropSaving(currentKwh, effectiveRateSen);
+    behaviourMissions.push({
+      icon: '⚠️',
+      title: language === 'BM' ? 'Masih Melebihi 600 kWh' : 'Still Above 600 kWh',
+      description: language === 'BM'
+        ? `Bulan kedua berturut-turut anda melebihi 600 kWh. Anda ${excessKwh} kWh melepasi had. Kurangkan sebanyak ini untuk turun bawah 600 kWh dan buang RM${tierDropSaving} caj tambahan.`
+        : `2nd month in a row above 600 kWh. You're ${excessKwh} kWh over the limit. Cut this much to drop below 600 kWh and remove RM${tierDropSaving} in extra charges.`,
+      estimatedSavingMyr: tierDropSaving,
+      appliance: null,
+      isBehaviourMission: true
+    });
+  } else if (stayedBelow) {
+    behaviourMissions.push({
+      icon: '✅',
+      title: language === 'BM' ? 'Kekal Bawah 600 kWh' : 'Staying Below 600 kWh',
+      description: language === 'BM'
+        ? `Anda kekal bawah 600 kWh sekali lagi — syabas. Anda dilindungi daripada Caj Runcit dan SST.`
+        : `You've stayed under 600 kWh again — well done. You're protected from Retail Charge and SST.`,
+      estimatedSavingMyr: 0,
+      appliance: null,
+      isBehaviourMission: true
+    });
+  }
+
+  // ── Bleeder rank-shift scenario ──
+  if (currentTopBleederType && referenceTopBleederType) {
+    if (currentTopBleederType !== referenceTopBleederType) {
+      behaviourMissions.push({
+        icon: '🔄',
+        title: language === 'BM' ? 'Pembazir #1 Anda Berubah' : 'Your #1 Bleeder Changed',
+        description: language === 'BM'
+          ? `Kos terbesar anda bulan lepas (${referenceTopBleederType.replace('_', ' ')}) bukan lagi #1 — syabas jika anda sudah bertindak. Pembazir #1 baharu anda sekarang: ${currentTopBleederType.replace('_', ' ')}.`
+          : `Your biggest cost last month (${referenceTopBleederType.replace('_', ' ')}) is no longer #1 — well done if you acted on it. Your new #1 bleeder is now: ${currentTopBleederType.replace('_', ' ')}.`,
+        estimatedSavingMyr: 0,
+        appliance: null,
+        isBehaviourMission: true
+      });
+    } else {
+      behaviourMissions.push({
+        icon: '🔁',
+        title: language === 'BM' ? 'Pembazir #1 Sama Lagi' : 'Same #1 Bleeder Again',
+        description: language === 'BM'
+          ? `${currentTopBleederType.replace('_', ' ')} masih kos terbesar anda, tiada perubahan dari bulan lepas. Penjimatan masih menanti jika anda bertindak.`
+          : `${currentTopBleederType.replace('_', ' ')} is still your biggest cost, unchanged from last month. The saving is still waiting if you act on it.`,
+        estimatedSavingMyr: 0,
+        appliance: null,
+        isBehaviourMission: true
+      });
+    }
+  }
+
+  return behaviourMissions;
 };
 
 
@@ -555,6 +666,7 @@ const calculateInstitutionalWaste = (appliances, actualKwh, effectiveRateSen, bi
 module.exports = {
   analyseBleeders,
   generateMissions,
+  generateBehaviourMission,
   generateInstitutionalProfile,
   calculateInstitutionalWaste,
   calculateTeaserRange,
