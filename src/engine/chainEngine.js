@@ -77,29 +77,16 @@ const getChainStatus = async (userId, prisma) => {
 
   const lastMonth = lastRecord.billingMonth;
   const expectedNextMonth = getNextMonth(lastMonth);
-  const currentMonth = getCurrentMonth();
-  const monthsLapsed = getMonthsDiff(lastMonth, currentMonth);
 
-  // Chain intact — expected next month is current or last month
-  // monthsLapsed === 1 means last saved is current month
-  // Allow upload of current month bill
-  if (monthsLapsed === 1) {
-    return {
-      status: 'MONTHLY',
-      billsRequired: 1,
-      lastBillingMonth: lastMonth,
-      expectedNextMonth,
-      monthsLapsed: 1
-    };
-  }
-
-  // Chain broken — lapsed more than 1 month
+  // Chain is determined ONLY by billing month continuity — never by real calendar date
+  // User's last saved bill is "current". Next upload must be the month right after it.
+  // RESET only happens if user explicitly uploads a non-consecutive month (caught in validateUploadedBills)
   return {
-    status: 'RESET',
-    billsRequired: 2,
+    status: 'MONTHLY',
+    billsRequired: 1,
     lastBillingMonth: lastMonth,
     expectedNextMonth,
-    monthsLapsed
+    monthsLapsed: null
   };
 };
 
