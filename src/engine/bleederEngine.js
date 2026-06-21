@@ -37,6 +37,8 @@ const APPLIANCE_WATTAGE = {
   COMPUTER:        { wattage: 200  },
   FAN:             { wattage: 50   },
   IRON:            { wattage: 1000 },
+  OVEN:            { wattage: 2200 },
+  WIFI_ROUTER:     { wattage: 10   },
   OTHER:           { wattage: 100  }
 };
 
