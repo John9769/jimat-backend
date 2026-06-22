@@ -58,6 +58,7 @@ enum ApplianceType {
   COMPUTER
   FAN
   IRON
+  WIFI_ROUTER
   OTHER
 }
 
