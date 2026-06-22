@@ -95,6 +95,22 @@ const scanBills = async (req, res) => {
     const chainStatus = await getChainStatus(req.user.id, prisma);
     const pricing = getPricing(req.user.userType, chainStatus.status);
 
+    // ── APPLIANCE GATE — HOUSEHOLD MUST DECLARE APPLIANCES FIRST ──
+    if (req.user.userType === 'HOUSEHOLD') {
+      const applianceCount = await prisma.appliance.count({
+        where: { userId: req.user.id }
+      });
+      if (applianceCount === 0) {
+        return res.status(400).json({
+          success: false,
+          errorCode: 'NO_APPLIANCES',
+          message: req.user.language === 'BM'
+            ? 'Sila tambah peralatan rumah anda dahulu sebelum muat naik bil. Profil peralatan diperlukan untuk analisis yang tepat.'
+            : 'Please add your home appliances before uploading bills. Appliance profile is required for accurate analysis.'
+        });
+      }
+    }
+
     if (chainStatus.billsRequired === 2 && files.length < 2) {
       return res.status(400).json({
         success: false,
